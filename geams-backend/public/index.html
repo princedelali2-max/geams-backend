@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEAMS — Choose an app</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0e14; color: #e6edf3; margin: 0; padding: 32px 16px; }
+  .wrap { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin-bottom: 4px; }
+  p.sub { color: #8b949e; font-size: 0.85rem; margin-bottom: 28px; }
+  a.card { display: block; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 18px; margin-bottom: 12px; text-decoration: none; color: #e6edf3; }
+  a.card:active { background: #1c2129; }
+  a.card .icon { font-size: 1.4rem; margin-right: 10px; }
+  a.card .name { font-weight: 600; font-size: 0.95rem; }
+  a.card .desc { font-size: 0.75rem; color: #8b949e; margin-top: 2px; }
+  .status { margin-top: 28px; font-size: 0.72rem; color: #6e7681; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>GEAMS</h1>
+    <p class="sub">Open the app for this device.</p>
+    <a class="card" href="/civilian"><span class="icon">🆘</span><span class="name">Civilian App</span><div class="desc">Report incidents, request help, share location</div></a>
+    <a class="card" href="/lcr"><span class="icon">🏢</span><span class="name">LCR / Station Dashboard</span><div class="desc">Local control room — manage incidents, dispatch units</div></a>
+    <a class="card" href="/dispatch"><span class="icon">👮</span><span class="name">Dispatch (Officer)</span><div class="desc">Field officer app — jobs, GPS, calls</div></a>
+    <a class="card" href="/fire"><span class="icon">🚒</span><span class="name">Fire Service</span><div class="desc">Fire unit response app</div></a>
+    <a class="card" href="/medical"><span class="icon">🚑</span><span class="name">Medical / Ambulance</span><div class="desc">Medical response unit app</div></a>
+    <a class="card" href="/hq"><span class="icon">🏛️</span><span class="name">HQ Dashboard</span><div class="desc">National command — all stations, all incidents</div></a>
+    <div class="status">Backend: <span id="status">checking…</span></div>
+  </div>
+  <script>
+    fetch('/api/health').then(r => r.json()).then(d => {
+      document.getElementById('status').textContent = d.ok ? `online · ${d.clients} device(s) connected` : 'unreachable';
+    }).catch(() => { document.getElementById('status').textContent = 'unreachable'; });
+  </script>
+</body>
+</html>

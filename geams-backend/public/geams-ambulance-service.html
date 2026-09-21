@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<script>
+/* ── GEAMS BACKEND CONFIG ── see geams-civilian-app.html for the full
+   explanation. Every device must use the SAME two values. */
+window.GEAMS_BACKEND_URL = '';
+window.GEAMS_AUTH_TOKEN  = '';
+</script>
+<script>
+/* ── MOBILE VIEWPORT HEIGHT FIX ── #app below is height:100vh +
+   overflow:hidden. On a real phone, 100vh overshoots the actually-visible
+   area (browser chrome eats the difference), so content near the bottom —
+   including buttons — can end up in a gap with no scroll route to reach
+   it. This measures the real visible viewport instead and keeps it
+   current as the browser UI/keyboard show or hide. */
+(function () {
+  function setAppHeight() {
+    var h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    document.documentElement.style.setProperty('--app-vh', h + 'px');
+  }
+  setAppHeight();
+  window.addEventListener('resize', setAppHeight);
+  window.addEventListener('orientationchange', function () { setTimeout(setAppHeight, 120); });
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', setAppHeight);
+})();
+</script>
+<title>GEAMS Medical Response — Ghana National Ambulance Service</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root{
+    --bg:#0a0f14; --bg-raised:#111a22; --bg-deep:#070b0f;
+    --red:#3b82f6; --red-dim:rgba(59,130,246,0.12); --red-border:rgba(59,130,246,0.35);
+    --orange:#fb923c; --gold:#e8b84b; --green:#4ade80; --cyan:#38bdf8;
+    --text-primary:#f1f5f9; --text-muted:#8fa3b8; --text-ghost:#5e7a96;
+    --border-base:#1e2b38; --border-mid:#2a3a4a;
+    --r-sm:6px; --r-md:10px; --r-lg:16px;
+    --font-mono:'SF Mono',Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text-primary);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;height:100vh;height:var(--app-vh, 100vh);overflow:hidden}
+  #app{height:100vh;height:var(--app-vh, 100vh);display:flex;flex-direction:column;max-width:520px;margin:0 auto;position:relative;background:var(--bg)}
+
+  /* ── LOGIN ── */
+  .login-wrap{flex:1;display:flex;flex-direction:column;justify-content:center;padding:32px 24px;overflow-y:auto}
+  .login-logo{font-size:1.8rem;font-weight:800;text-align:center;letter-spacing:1px;color:var(--red)}
+  .login-sub{text-align:center;color:var(--text-muted);font-size:0.85rem;margin-top:4px;margin-bottom:24px}
+  .login-security-bar{display:flex;align-items:center;gap:8px;background:var(--red-dim);border:1px solid var(--red-border);border-radius:var(--r-md);padding:8px 12px;margin-bottom:18px}
+  .login-security-dot{width:7px;height:7px;border-radius:50%;background:var(--red);animation:blink 1.4s infinite}
+  .login-security-txt{font-family:var(--font-mono);font-size:0.6rem;letter-spacing:1px;color:var(--red)}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
+  .login-field{margin-bottom:14px}
+  .login-label{display:block;font-size:0.7rem;font-weight:600;color:var(--text-muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:0.5px}
+  .login-input{width:100%;background:var(--bg-raised);border:1px solid var(--border-mid);border-radius:var(--r-md);padding:11px 13px;color:var(--text-primary);font-size:0.88rem}
+  .login-input:focus{outline:none;border-color:var(--red)}
+  .login-input.error{border-color:var(--red)}
+  .login-error{display:none;font-size:0.68rem;color:var(--red);margin-top:4px}
+  .login-error.show{display:block}
+  .login-btn{width:100%;background:var(--red);color:white;border:none;border-radius:var(--r-md);padding:13px;font-size:0.9rem;font-weight:700;cursor:pointer;margin-top:6px}
+  .login-btn:disabled{opacity:0.5;cursor:not-allowed}
+  .login-meta{display:flex;justify-content:center;gap:16px;margin-top:16px;font-size:0.72rem}
+  .login-meta-link{color:var(--cyan);cursor:pointer}
+
+  /* ── TOPBAR ── */
+  .topbar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border-base);flex-shrink:0;background:var(--bg-raised)}
+  .topbar-logo{font-weight:800;font-size:0.95rem;color:var(--red)}
+  .topbar-dot{width:8px;height:8px;border-radius:50%;background:var(--text-ghost)}
+  .topbar-dot.busy{background:var(--red);animation:blink 1.4s infinite}
+  .topbar-crew{font-size:0.7rem;color:var(--text-muted);margin-left:auto}
+  .topbar-btn{background:none;border:none;color:var(--text-muted);font-size:1rem;cursor:pointer;padding:4px 6px}
+
+  /* ── SCREENS ── */
+  /* ── REAL BUG FOUND ── .screen is a flex item of #app (flex:1) but had no
+     min-height:0. Flex items default to min-height:auto, which means "never
+     shrink below your content's natural size" — so instead of being capped
+     to the space available and scrolling internally via overflow-y:auto,
+     .screen (and #app, and body) were free to grow taller than the actual
+     viewport. With overflow:hidden on the ancestors, that extra height was
+     just clipped, with no scroll path to it at all. This is very likely the
+     actual cause of "can't scroll to reach other buttons." */
+  .screen{display:none;flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y;flex-direction:column}
+  .screen.active{display:flex}
+
+  .empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 24px;text-align:center;color:var(--text-muted)}
+  .empty-state-icon{font-size:2.6rem;margin-bottom:12px;opacity:0.6}
+
+  .call-card{margin:14px;background:var(--bg-raised);border:1px solid var(--red-border);border-radius:var(--r-lg);padding:16px;animation:pulseCard 2s infinite}
+  @keyframes pulseCard{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.25)}50%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}
+  .call-card-type{font-size:1.05rem;font-weight:800;color:var(--red)}
+  .call-card-meta{font-size:0.76rem;color:var(--text-muted);margin-top:4px;line-height:1.6}
+  .call-card-actions{display:flex;gap:8px;margin-top:14px}
+  .btn{border:none;border-radius:var(--r-md);padding:10px 14px;font-size:0.8rem;font-weight:700;cursor:pointer}
+  .btn-full{flex:1}
+  .btn-primary{background:var(--red);color:white}
+  .btn-ghost{background:var(--bg-deep);color:var(--text-muted);border:1px solid var(--border-mid)}
+  .btn-success{background:var(--green);color:#052e16}
+  .btn-warning{background:var(--orange);color:#431407}
+  .btn-cyan{background:var(--cyan);color:#082f49}
+  .btn-sm{padding:7px 10px;font-size:0.72rem}
+  .btn:disabled{opacity:0.5;cursor:not-allowed}
+
+  .queue-item{margin:0 14px 10px;background:var(--bg-raised);border:1px solid var(--border-base);border-radius:var(--r-md);padding:12px 14px;display:flex;align-items:center;gap:10px;cursor:pointer}
+  .queue-item-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+
+  .stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:0 14px 14px}
+  .stat-box{background:var(--bg-raised);border:1px solid var(--border-base);border-radius:var(--r-md);padding:10px 6px;text-align:center}
+  .stat-val{font-size:1.1rem;font-weight:800;font-family:var(--font-mono)}
+  .stat-key{font-size:0.58rem;color:var(--text-ghost);text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}
+
+  #incident-map{width:100%;height:280px;flex-shrink:0}
+  .action-bar{display:flex;gap:8px;padding:14px}
+  .job-detail{padding:14px}
+  .job-detail-row{font-size:0.8rem;color:var(--text-muted);margin-bottom:6px;line-height:1.5}
+  .toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:9999;background:var(--bg-raised);border:1px solid var(--border-mid);border-radius:var(--r-md);padding:11px 16px;font-size:0.8rem;max-width:90%;box-shadow:0 6px 20px rgba(0,0,0,0.5);display:flex;gap:8px;align-items:flex-start}
+  .toast.success{border-color:var(--green)} .toast.error{border-color:var(--red)}
+  .toast.warning{border-color:var(--orange)} .toast.info{border-color:var(--cyan)}
+  .nav-tabs{display:flex;border-top:1px solid var(--border-base);background:var(--bg-raised);flex-shrink:0}
+  .nav-tab{flex:1;text-align:center;padding:9px 4px;font-size:0.62rem;color:var(--text-ghost);cursor:pointer}
+  .nav-tab.active{color:var(--red)}
+  .nav-tab-icon{font-size:1.1rem;display:block}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- LOGIN -->
+  <div class="login-wrap" id="login-view">
+    <div class="login-logo">🚑 GEAMS MEDIC</div>
+    <div class="login-sub">Ghana National Ambulance Service — Response Terminal</div>
+    <div class="login-security-bar"><div class="login-security-dot"></div><div class="login-security-txt">SECURE CHANNEL · CREW LOGIN REQUIRED</div></div>
+
+    <div class="login-field">
+      <label class="login-label" for="login-name">Paramedic Name</label>
+      <input class="login-input" id="login-name" type="text" placeholder="e.g. Senior Paramedic A. Owusu" autocomplete="username">
+      <div class="login-error" id="err-name">Name is required</div>
+    </div>
+    <div class="login-field">
+      <label class="login-label" for="login-pass">Password</label>
+      <input class="login-input" id="login-pass" type="password" placeholder="Enter password" autocomplete="current-password">
+      <div class="login-error" id="err-pass">Password is required</div>
+    </div>
+    <div class="login-error" id="err-general" style="text-align:center;margin-top:6px"></div>
+    <button class="login-btn" id="login-btn" onclick="AmbulanceApp.doLogin()">🔐 Sign In</button>
+    <div class="login-meta">
+      <span class="login-meta-link" onclick="AmbulanceApp.showSignup()">🚑 New crew member? Register</span>
+    </div>
+    <div style="text-align:center;margin-top:18px;font-family:var(--font-mono);font-size:0.6rem;color:var(--text-ghost)">
+      Demo: Senior Paramedic A. Owusu / Medic@2024!
+    </div>
+  </div>
+
+  <!-- SIGNUP -->
+  <div class="login-wrap" id="signup-view" style="display:none">
+    <div class="login-logo">🚑 GEAMS MEDIC</div>
+    <div class="login-sub">Crew Registration</div>
+    <div class="login-field"><label class="login-label">Full Name</label>
+      <input class="login-input" id="su-name" placeholder="e.g. FO J. Owusu"></div>
+    <div class="login-field"><label class="login-label">Rank</label>
+      <select class="login-input" id="su-rank">
+        <option>Emergency Medical Technician (EMT)</option><option>Paramedic</option>
+        <option>Senior Paramedic</option><option>Ambulance Officer</option>
+      </select></div>
+    <div class="login-field"><label class="login-label">Phone</label>
+      <input class="login-input" id="su-phone" placeholder="+233-24-0000000"></div>
+    <div class="login-field"><label class="login-label">Ambulance Unit Number</label>
+      <input class="login-input" id="su-vehicle" placeholder="e.g. Ambulance 12"></div>
+    <div class="login-field"><label class="login-label">Assigned Jurisdiction (LCR coverage area)</label>
+      <select class="login-input" id="su-lcr"><!-- populated by JS from STATION_DIRECTORY --></select></div>
+    <div class="login-field"><label class="login-label">Create Password</label>
+      <input class="login-input" id="su-pass" type="password" placeholder="At least 6 characters"></div>
+    <div class="login-field"><label class="login-label">Confirm Password</label>
+      <input class="login-input" id="su-pass2" type="password" placeholder="Re-enter password"></div>
+    <div class="login-error" id="su-err-general" style="text-align:center;margin-top:6px"></div>
+    <button class="login-btn" id="signup-btn" onclick="AmbulanceApp.doSignup()">🚑 Register &amp; Sign In</button>
+    <div class="login-meta"><span class="login-meta-link" onclick="AmbulanceApp.showLogin()">← Back to Sign In</span></div>
+  </div>
+
+  <!-- MAIN APP -->
+  <div id="main-view" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+    <div class="topbar">
+      <span class="topbar-logo">🚑 MEDIC</span>
+      <span class="topbar-dot" id="topbar-dot"></span>
+      <span class="topbar-crew" id="topbar-crew"></span>
+      <button class="topbar-btn" onclick="AmbulanceApp.endShift()" title="End Shift">⏻</button>
+    </div>
+
+    <div class="screen active" id="screen-queue"></div>
+    <div class="screen" id="screen-job"></div>
+
+    <div class="nav-tabs">
+      <div class="nav-tab active" data-screen="queue" onclick="AmbulanceApp.navigate('queue')"><span class="nav-tab-icon">📋</span>Calls</div>
+      <div class="nav-tab" data-screen="job" onclick="AmbulanceApp.navigate('job')"><span class="nav-tab-icon">🗺</span>Active Response</div>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+</div>
+
+<script>
+/* ============================================================
+   GEAMS SYNC — shared real-time layer (same implementation as the
+   other GEAMS apps — window.storage when run as a Claude artifact,
+   localStorage when served via geams-static-server.js).
+   ============================================================ */
+// ── REAL-TIME BACKEND CLIENT ──────────────────────────────────────────
+// This used to be a localStorage-only wrapper — GeamsSync.available()
+// only ever confirmed localStorage existed in THIS browser, which is
+// true on almost every device, including ones with zero connection to
+// any other location. Every place elsewhere in this file annotated
+// "GeamsSync.available() isn't a real connectivity check" is fixed by
+// this swap: available() now means "the WebSocket to the real GEAMS
+// backend is actually open," so every existing call site (mergeShared,
+// watch, pushChat, etc.) keeps working completely unchanged, but is now
+// genuinely real-time across devices instead of only within one
+// browser's tabs. See geams-realtime-backend-spec.md and backend/server.js.
+//
+// Configure per deployment: set window.GEAMS_BACKEND_URL (e.g.
+// 'wss://your-server.example.org/ws') and window.GEAMS_AUTH_TOKEN before
+// this script runs — see the config block near the top of <head>. Left
+// unconfigured, available() correctly reports false forever and every
+// existing offline/demo fallback in this app keeps working exactly as
+// it did before, same as when localStorage was unavailable previously.
+const GeamsSync = (() => {
+  // If opened as a plain local file (file://) or with no config set at
+  // all, there's no same-origin server to guess — stay in offline/demo
+  // mode. If this page was itself served BY the GEAMS backend (e.g. via
+  // Render's free static hosting — see backend/README.md), auto-detect
+  // the WebSocket URL from the page's own origin so no manual editing is
+  // needed for that deployment path. An explicit window.GEAMS_BACKEND_URL
+  // always wins over auto-detection.
+  const GEAMS_BACKEND_URL = (typeof window !== 'undefined' && window.GEAMS_BACKEND_URL) ||
+    (typeof location !== 'undefined' && /^https?:$/.test(location.protocol)
+      ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'
+      : '');
+  const GEAMS_AUTH_TOKEN  = (typeof window !== 'undefined' && window.GEAMS_AUTH_TOKEN)  || '';
+
+  const CLIENT_ID = (() => {
+    try {
+      let id = localStorage.getItem('geams_client_id');
+      if (!id) {
+        id = 'c_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+        localStorage.setItem('geams_client_id', id);
+      }
+      return id;
+    } catch (e) { return 'c_' + Math.random().toString(36).slice(2); }
+  })();
+
+  let mode = 'checking'; // 'connecting' | 'connected' | 'offline'
+  let ws = null;
+  let reconnectDelay = 1000;
+  let reqCounter = 0;
+  let myUserId = null;
+  const pending = new Map();        // reqId -> resolve fn
+  const watchers = new Map();       // key -> Set<cb>
+  const localCache = new Map();     // key -> last known value (seeds watch() instantly, survives disconnects)
+  const callListeners = new Set();  // cb(fromUserId, payload)
+  let resolveReady;
+  const readyPromise = new Promise((r) => { resolveReady = r; });
+
+  function connect() {
+    if (!GEAMS_BACKEND_URL) { mode = 'offline'; resolveReady(); return; }
+    mode = 'connecting';
+    let socket;
+    try {
+      const url = GEAMS_BACKEND_URL +
+        (GEAMS_BACKEND_URL.includes('?') ? '&' : '?') +
+        'clientId=' + encodeURIComponent(CLIENT_ID) + '&token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
+      socket = new WebSocket(url);
+    } catch (e) { mode = 'offline'; resolveReady(); scheduleReconnect(); return; }
+    ws = socket;
+
+    ws.onopen = () => {
+      mode = 'connected';
+      reconnectDelay = 1000;
+      if (myUserId) send({ type:'register', userId: myUserId });
+      for (const key of watchers.keys()) send({ type:'watch', key });
+      resolveReady();
+    };
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'result' && pending.has(msg.reqId)) {
+        const resolve = pending.get(msg.reqId);
+        pending.delete(msg.reqId);
+        resolve(msg);
+      } else if (msg.type === 'update') {
+        localCache.set(msg.key, msg.value);
+        const cbs = watchers.get(msg.key);
+        if (cbs) cbs.forEach((cb) => { try { cb(msg.value); } catch (e) { console.error(e); } });
+      } else if (msg.type === 'call') {
+        callListeners.forEach((cb) => { try { cb(msg.fromUserId, msg.payload); } catch (e) { console.error(e); } });
+      } else if (msg.type === 'pong') {
+        /* heartbeat ack, nothing to do */
+      }
+    };
+
+    ws.onclose = () => {
+      const wasConnected = mode === 'connected';
+      mode = 'offline';
+      ws = null;
+      // Fail every request in flight rather than hanging forever.
+      for (const [id, resolve] of pending) resolve(null);
+      pending.clear();
+      if (wasConnected) console.warn('[GeamsSync] real-time connection lost — reconnecting…');
+      scheduleReconnect();
+    };
+    ws.onerror = () => { /* onclose follows; handled there */ };
+  }
+
+  function scheduleReconnect() {
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === ws.OPEN) { ws.send(JSON.stringify(obj)); return true; }
+    return false;
+  }
+
+  function request(obj) {
+    return new Promise((resolve) => {
+      const reqId = ++reqCounter;
+      if (!send(Object.assign({}, obj, { reqId }))) { resolve(null); return; }
+      pending.set(reqId, resolve);
+      setTimeout(() => { if (pending.has(reqId)) { pending.delete(reqId); resolve(null); } }, 8000);
+    });
+  }
+
+  connect();
+
+  function available() { return mode === 'connected'; }
+
+  async function getShared(key, fallback) {
+    await readyPromise;
+    if (mode !== 'connected') return localCache.has(key) ? localCache.get(key) : fallback;
+    const res = await request({ type:'get', key });
+    if (res && res.ok) {
+      const value = res.value === null || res.value === undefined ? fallback : res.value;
+      localCache.set(key, value);
+      return value;
+    }
+    return localCache.has(key) ? localCache.get(key) : fallback;
+  }
+
+  async function setShared(key, value) {
+    await readyPromise;
+    localCache.set(key, value);
+    if (mode !== 'connected') return false;
+    const res = await request({ type:'set', key, value });
+    return !!(res && res.ok);
+  }
+
+  async function mergeShared(key, fallback, patchFn) {
+    await readyPromise;
+    try {
+      const cur = await getShared(key, fallback);
+      const next = patchFn(cur);
+      return await setShared(key, next);
+    } catch (e) { console.error('[GeamsSync] mergeShared failed:', e); return false; }
+  }
+
+  function watch(key, fallback, cb, /* intervalMs unused — real push now, kept for signature compat */ _intervalMs) {
+    let stopped = false;
+    if (!watchers.has(key)) watchers.set(key, new Set());
+    watchers.get(key).add(cb);
+    send({ type:'watch', key });
+    // Fire once immediately so callers see something without waiting on
+    // a full round trip — matches the old polling version's behavior of
+    // calling back right away with whatever's available.
+    getShared(key, fallback).then((v) => { if (!stopped) cb(v); });
+    return () => {
+      stopped = true;
+      const set = watchers.get(key);
+      if (set) {
+        set.delete(cb);
+        if (set.size === 0) { watchers.delete(key); send({ type:'unwatch', key }); }
+      }
+    };
+  }
+
+  /* ── CALL SIGNALING (WebRTC) ──────────────────────────────────────────
+     A thin relay, not stored state: registerUserId ties this socket to
+     a real identity (civilian id / officer badge / station id) so the
+     server can route call.* messages to the right person; onSignal/
+     sendSignal carry the offer/answer/ICE candidates. Building the
+     actual RTCPeerConnection is left to each app (see the "real call"
+     helper wired into the civilian/dispatch/station apps), since each
+     needs slightly different UI around it. */
+  function registerUserId(userId) {
+    myUserId = userId;
+    send({ type:'register', userId });
+  }
+  function onSignal(cb) { callListeners.add(cb); return () => callListeners.delete(cb); }
+  function sendSignal(toUserId, payload) { return send({ type:'call', toUserId, payload }); }
+
+  return {
+    available, getShared, setShared, mergeShared, watch,
+    ready: readyPromise, get mode() { return mode; }, get clientId() { return CLIENT_ID; },
+    registerUserId, onSignal, sendSignal,
+  };
+})();
+
+/* ============================================================
+   AMBULANCE DATA — jurisdiction directory, crew credentials, active job
+   ============================================================ */
+const AmbulanceData = (() => {
+  const STATION_DIRECTORY = [
+    { id:'GH-GA-ACC-001-B9C1', name:'Accra Central',  lat:5.5502,  lng:-0.2174 },
+    { id:'GH-GA-ACC-007-F2A3', name:'Tema',            lat:5.6698,  lng:-0.0167 },
+    { id:'GH-AS-KUM-001-A4F2', name:'Kumasi Central',  lat:6.6885,  lng:-1.6244 },
+    { id:'GH-AS-KUM-002-C7D9', name:'Suame',           lat:6.7228,  lng:-1.6131 },
+    { id:'GH-WR-TAK-001-D2E8', name:'Takoradi',        lat:4.8993,  lng:-1.7557 },
+    { id:'GH-CR-CAP-001-E5F1', name:'Cape Coast',      lat:5.1054,  lng:-1.2466 },
+    { id:'GH-NR-TAM-001-G3H6', name:'Tamale',          lat:9.4008,  lng:-0.8393 },
+    { id:'GH-UE-BOL-001-H8I2', name:'Bolgatanga',      lat:10.7853, lng:-0.8514 },
+    { id:'GH-VR-HO-001-J4K7',  name:'Ho Central',      lat:6.6011,  lng:0.4714  },
+    { id:'GH-VR-HOH-001-P3Q7', name:'Hohoe',           lat:7.1528,  lng:0.4694  },
+    { id:'GH-BA-SUN-001-K9L3', name:'Sunyani',         lat:7.3349,  lng:-2.3264 },
+    { id:'GH-AH-KOF-001-L1M5', name:'Koforidua',       lat:6.0944,  lng:-0.2590 },
+    { id:'GH-SW-SEK-001-M6N9', name:'Sekondi',         lat:4.9340,  lng:-1.7039 },
+  ];
+
+  const MOCK_CREDENTIALS = [
+    { badge:'GNAS-1001', password:'Medic@2024!', crewId:'MEDIC-1001', name:'Senior Paramedic A. Owusu',
+      rank:'Senior Paramedic', lcrId:'GH-GA-ACC-001-B9C1', vehicle:'Ambulance 7', phone:'+233-24-5552001' },
+  ];
+  let REGISTERED_CREDENTIALS = [];
+  (function load() {
+    try { const raw = localStorage.getItem('geams_ambulance_registered'); if (raw) REGISTERED_CREDENTIALS = JSON.parse(raw); }
+    catch (e) { REGISTERED_CREDENTIALS = []; }
+  })();
+  function saveRegistered() { try { localStorage.setItem('geams_ambulance_registered', JSON.stringify(REGISTERED_CREDENTIALS)); } catch (e) {} }
+  function registerCrew(cred) { REGISTERED_CREDENTIALS.push(cred); saveRegistered(); }
+  function allCredentials() { return MOCK_CREDENTIALS.concat(REGISTERED_CREDENTIALS); }
+  function findStation(lcrId) { return STATION_DIRECTORY.find(s => s.id === lcrId); }
+
+  let crew = null;       // active logged-in crew profile
+  let currentJob = null; // active response, or null when idle
+
+  return {
+    STATION_DIRECTORY, allCredentials, registerCrew, findStation,
+    get crew() { return crew; }, setCrew(c) { crew = c; },
+    get currentJob() { return currentJob; }, setCurrentJob(j) { currentJob = j; },
+  };
+})();
+
+/* ============================================================
+   GEAMS AMBULANCE SYNC — receives incidents forwarded by an LCR in real
+   time, scoped strictly to this crew's own jurisdiction, and pushes
+   status/position updates back so the LCR sees live progress.
+   ============================================================ */
+const GeamsAmbulanceSync = (() => {
+  const claimed = new Set(); // incident ids already surfaced in this session — no duplicates
+  let watchStop = null;
+
+  function start(lcrId) {
+    if (watchStop) watchStop();
+    watchStop = GeamsSync.watch('ambulance:' + lcrId + ':incidents', {}, (map) => {
+      Object.values(map).forEach(rec => {
+        if (rec.serviceStatus !== 'new') return;              // already claimed by someone
+        if (claimed.has(rec.id)) return;                       // already surfaced this session
+        if (AmbulanceData.currentJob && AmbulanceData.currentJob.id === rec.id) return;
+        claimed.add(rec.id);
+        AmbulanceApp.onNewCall(rec);
+      });
+    }, 2500);
+  }
+
+  function pushUpdate(lcrId, incId, patch) {
+    GeamsSync.mergeShared('ambulance:' + lcrId + ':incidents', {}, (m) => {
+      m = m || {};
+      if (!m[incId]) return m;
+      Object.assign(m[incId], patch);
+      return m;
+    });
+  }
+
+  return { start, pushUpdate };
+})();
+
+/* ============================================================
+   AMBULANCE APP — UI, navigation, login/signup, queue, active response
+   ============================================================ */
+const AmbulanceApp = (() => {
+  let currentScreen = 'queue';
+  let queue = [];              // incoming, not-yet-accepted calls (local view)
+  let routeTimer = null;
+  let map = null, unitMarker = null, incMarker = null, routeLine = null;
+  let routeCoords = [], routeStep = 0;
+
+  /* ── TOASTS ── */
+  function showToast(type, title, msg, duration=4500) {
+    const c = document.getElementById('toast-container');
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    const icon = {success:'✅',error:'🚨',warning:'⚠️',info:'ℹ️'}[type] || 'ℹ️';
+    el.innerHTML = `<span>${icon}</span><div><div style="font-weight:700;font-size:0.8rem">${title}</div><div style="color:var(--text-muted);font-size:0.74rem;margin-top:2px">${msg}</div></div>`;
+    c.appendChild(el);
+    setTimeout(() => el.remove(), duration);
+  }
+
+  /* ── LOGIN / SIGNUP ── */
+  function showSignup() {
+    document.getElementById('login-view').style.display = 'none';
+    document.getElementById('signup-view').style.display = 'flex';
+    const sel = document.getElementById('su-lcr');
+    if (sel && !sel.dataset.filled) {
+      sel.innerHTML = '<option value="">— Select jurisdiction —</option>' +
+        AmbulanceData.STATION_DIRECTORY.map(s => `<option value="${s.id}">${s.name} LCR</option>`).join('');
+      sel.dataset.filled = '1';
+    }
+  }
+  function showLogin() {
+    document.getElementById('signup-view').style.display = 'none';
+    document.getElementById('login-view').style.display = 'flex';
+  }
+
+  function doLogin() {
+    const name = (document.getElementById('login-name')?.value || '').trim();
+    const pass = document.getElementById('login-pass')?.value || '';
+    const genErr = document.getElementById('err-general');
+    ['login-name','login-pass'].forEach(id => document.getElementById(id)?.classList.remove('error'));
+    ['err-name','err-pass'].forEach(id => document.getElementById(id)?.classList.remove('show'));
+    if (genErr) genErr.textContent = '';
+    let valid = true;
+    if (!name) { document.getElementById('login-name')?.classList.add('error'); document.getElementById('err-name')?.classList.add('show'); valid = false; }
+    if (!pass) { document.getElementById('login-pass')?.classList.add('error'); document.getElementById('err-pass')?.classList.add('show'); valid = false; }
+    if (!valid) return;
+
+    const btn = document.getElementById('login-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Authenticating…'; }
+    setTimeout(() => {
+      const cred = AmbulanceData.allCredentials().find(c => c.name.toLowerCase() === name.toLowerCase() && c.password === pass);
+      if (!cred) {
+        if (genErr) genErr.textContent = 'Invalid name or password.';
+        if (btn) { btn.disabled = false; btn.textContent = '🔐 Sign In'; }
+        return;
+      }
+      enterApp(cred);
+    }, 700);
+  }
+
+  function doSignup() {
+    const name  = (document.getElementById('su-name')?.value || '').trim();
+    const rank  = document.getElementById('su-rank')?.value || 'Paramedic';
+    const phone = (document.getElementById('su-phone')?.value || '').trim();
+    const vehicle = (document.getElementById('su-vehicle')?.value || '').trim() || 'Unassigned';
+    const lcrId = document.getElementById('su-lcr')?.value || '';
+    const pass  = document.getElementById('su-pass')?.value || '';
+    const pass2 = document.getElementById('su-pass2')?.value || '';
+    const genErr = document.getElementById('su-err-general');
+    if (genErr) genErr.textContent = '';
+    if (!name || !phone || !lcrId || pass.length < 6 || pass !== pass2) {
+      if (genErr) genErr.textContent = !name || !phone || !lcrId ? 'Fill in all required fields.' :
+        pass.length < 6 ? 'Password must be at least 6 characters.' : 'Passwords do not match.';
+      return;
+    }
+    const cred = {
+      badge: 'GNAS-' + (2000 + Math.floor(Math.random()*7999)),
+      password: pass, crewId: 'MEDIC-' + (5000 + Math.floor(Math.random()*4999)),
+      name, rank, lcrId, vehicle, phone,
+    };
+    AmbulanceData.registerCrew(cred);
+    const btn = document.getElementById('signup-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Registering…'; }
+    setTimeout(() => enterApp(cred), 700);
+  }
+
+  function enterApp(cred) {
+    AmbulanceData.setCrew(cred);
+    const station = AmbulanceData.findStation(cred.lcrId);
+    document.getElementById('login-view').style.display = 'none';
+    document.getElementById('signup-view').style.display = 'none';
+    document.getElementById('main-view').style.display = 'flex';
+    document.getElementById('topbar-crew').textContent = `${cred.name} · ${station ? station.name : cred.lcrId}`;
+    GeamsAmbulanceSync.start(cred.lcrId);
+    navigate('queue');
+    showToast('success', 'Signed In', `Connected to ${station ? station.name : ''} LCR — listening for calls`, 5000);
+  }
+
+  function endShift() {
+    if (AmbulanceData.currentJob && AmbulanceData.currentJob.status !== 'complete') {
+      showToast('warning', 'Active Response', 'Complete or hand off your current call before ending shift', 5000);
+      return;
+    }
+    location.reload();
+  }
+
+  /* ── NAVIGATION ── */
+  function navigate(screen) {
+    currentScreen = screen;
+    document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.screen === screen));
+    document.getElementById('screen-queue').classList.toggle('active', screen === 'queue');
+    document.getElementById('screen-job').classList.toggle('active', screen === 'job');
+    if (screen === 'queue') renderQueue();
+    if (screen === 'job') renderJob();
+  }
+
+  /* ── INCOMING QUEUE ── */
+  function onNewCall(rec) {
+    queue.unshift(rec);
+    const dot = document.getElementById('topbar-dot');
+    if (dot) dot.classList.add('busy');
+    showToast('error', '🚨 New Call — ' + rec.priority.toUpperCase(), `${rec.type} · ${rec.location}`, 7000);
+    if (currentScreen === 'queue') renderQueue();
+  }
+
+  function renderQueue() {
+    const el = document.getElementById('screen-queue');
+    if (!el) return;
+    if (AmbulanceData.currentJob && AmbulanceData.currentJob.status !== 'complete') {
+      el.innerHTML = `<div class="empty-state">
+        <div class="empty-state-icon">🚑</div>
+        <div style="font-weight:700;margin-bottom:6px">Active response in progress</div>
+        <div style="font-size:0.78rem">Go to "Active Response" to manage ${AmbulanceData.currentJob.id}</div>
+      </div>`;
+      return;
+    }
+    if (!queue.length) {
+      el.innerHTML = `<div class="empty-state">
+        <div class="empty-state-icon">📡</div>
+        <div style="font-weight:700;margin-bottom:6px">Standing by</div>
+        <div style="font-size:0.78rem">Listening for calls forwarded by your Local Control Room in real time</div>
+      </div>`;
+      return;
+    }
+    el.innerHTML = queue.map(rec => {
+      const color = rec.priority === 'critical' ? 'var(--red)' : rec.priority === 'high' ? 'var(--orange)' : 'var(--gold)';
+      return `<div class="call-card" style="border-color:${color}">
+        <div class="call-card-type" style="color:${color}">${rec.type}</div>
+        <div class="call-card-meta">
+          📍 ${rec.location}<br>
+          🧭 GPS: ${rec.lat?.toFixed(5)}, ${rec.lng?.toFixed(5)}<br>
+          ${rec.civilianName ? '👤 Reported by: ' + rec.civilianName + (rec.civilianPhone ? ' · ' + rec.civilianPhone : '') + '<br>' : ''}
+          ${rec.notes ? '📝 ' + rec.notes + '<br>' : ''}
+          🏢 Forwarded by ${rec.forwardedBy || 'Control Room'} · Ref: ${rec.id}
+        </div>
+        <div class="call-card-actions">
+          <button class="btn btn-primary btn-full" onclick="AmbulanceApp.acceptCall('${rec.id}')">🚑 Respond</button>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  function acceptCall(incId) {
+    const rec = queue.find(r => r.id === incId);
+    if (!rec) return;
+    queue = queue.filter(r => r.id !== incId);
+    const crew = AmbulanceData.crew;
+    const station = AmbulanceData.findStation(crew.lcrId);
+    const job = {
+      id: rec.id, type: rec.type, priority: rec.priority, location: rec.location,
+      lat: rec.lat, lng: rec.lng, civilianName: rec.civilianName, civilianPhone: rec.civilianPhone,
+      notes: rec.notes, status: 'accepted', acceptedAt: Date.now(),
+      unitLat: station.lat, unitLng: station.lng, unitETA: null,
+    };
+    AmbulanceData.setCurrentJob(job);
+    GeamsAmbulanceSync.pushUpdate(crew.lcrId, incId, {
+      serviceStatus: 'accepted', unitName: crew.name, unitBadge: crew.badge,
+      unitLat: station.lat, unitLng: station.lng,
+    });
+    const dot = document.getElementById('topbar-dot');
+    if (dot) dot.classList.remove('busy');
+    showToast('success', 'Call Accepted', `${job.type} — navigating from ${station.name}`, 5000);
+    navigate('job');
+    startRoute(station, job);
+  }
+
+  /* ── ACTIVE RESPONSE / MAP ── */
+  function buildRoute(from, to, steps=40) {
+    const pts = [];
+    const midLat = (from.lat + to.lat) / 2 + (Math.random()-0.5)*0.01;
+    const midLng = (from.lng + to.lng) / 2 + (Math.random()-0.5)*0.01;
+    for (let i=0;i<=steps;i++) {
+      const t = i/steps;
+      const lat = (1-t)*(1-t)*from.lat + 2*(1-t)*t*midLat + t*t*to.lat;
+      const lng = (1-t)*(1-t)*from.lng + 2*(1-t)*t*midLng + t*t*to.lng;
+      pts.push([lat, lng]);
+    }
+    return pts;
+  }
+
+  // ── REAL-TIME-TEST NOTE ───────────────────────────────────────────────
+  // The old version stepped `unitLat/unitLng` through a precomputed curve
+  // on a 2s timer — simulated movement, which the multi-location test
+  // prohibits. `buildRoute()` is kept ONLY to draw the planned path as a
+  // static reference line; it must never set the unit's actual position.
+  // Position now comes only from this device's real GPS
+  // (navigator.geolocation.watchPosition), pushed to the backend as a
+  // `location.update` WebSocket message (see
+  // geams-realtime-backend-spec.md §3–4) instead of GeamsAmbulanceSync.pushUpdate.
+  let routeGeoWatchId = null;
+  function haversineKm(a, b, c, d) {
+    const R = 6371, toRad = x => x * Math.PI / 180;
+    const dLat = toRad(c - a), dLng = toRad(d - b);
+    const s = Math.sin(dLat/2)**2 + Math.cos(toRad(a))*Math.cos(toRad(c))*Math.sin(dLng/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(s));
+  }
+  function startRoute(station, job) {
+    routeCoords = buildRoute(station, job); // display-only planned path, not a position source
+    routeStep = 0;
+    if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
+    if (routeGeoWatchId !== null && navigator.geolocation) navigator.geolocation.clearWatch(routeGeoWatchId);
+
+    if (!navigator.geolocation) {
+      showToast('warning', 'GPS Unavailable', 'This device has no location support — position cannot be tracked', 6000);
+      // TODO(backend): send {type:'location.unavailable', payload:{entityId: AmbulanceData.crew.id, reason:'no_signal'}}
+      return;
+    }
+
+    routeGeoWatchId = navigator.geolocation.watchPosition(
+      pos => {
+        if (!AmbulanceData.currentJob || AmbulanceData.currentJob.status === 'complete') return;
+        if (AmbulanceData.currentJob.status !== 'en_route') return; // only track while actually en route
+        const lat = pos.coords.latitude, lng = pos.coords.longitude;
+        AmbulanceData.currentJob.unitLat = lat;
+        AmbulanceData.currentJob.unitLng = lng;
+        const remainingKm = haversineKm(lat, lng, job.lat, job.lng);
+        AmbulanceData.currentJob.unitETA = Math.max(0, Math.round(remainingKm / 0.5)); // ~30km/h assumption
+        // TODO(backend): replace with ws.send({type:'location.update', payload:{
+        //   entityType:'unit', entityId: AmbulanceData.crew.id, lat, lng,
+        //   accuracy: pos.coords.accuracy, capturedAt: Date.now(), source:'device_gps' }})
+        GeamsAmbulanceSync.pushUpdate(AmbulanceData.crew.lcrId, job.id, {
+          unitLat: lat, unitLng: lng, unitETA: AmbulanceData.currentJob.unitETA,
+        });
+        if (unitMarker) unitMarker.setLatLng([lat, lng]);
+        if (currentScreen === 'job') updateStatBar();
+        if (remainingKm < 0.05) {
+          showToast('info', 'Arriving', 'Unit has reached the scene — mark On Scene', 5000);
+        }
+      },
+      () => {
+        showToast('warning', 'GPS Signal Lost', 'Real-time position unavailable — last known location shown', 5000);
+        // TODO(backend): send {type:'location.unavailable', payload:{entityId: AmbulanceData.crew.id, reason:'denied'}}
+      },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 }
+    );
+  }
+
+  function setStatus(status) {
+    const job = AmbulanceData.currentJob;
+    if (!job) return;
+    job.status = status;
+    GeamsAmbulanceSync.pushUpdate(AmbulanceData.crew.lcrId, job.id, { serviceStatus: status });
+    const labels = { en_route:'En Route', on_scene:'On Scene', complete:'Call Complete' };
+    showToast('success', labels[status] || status, job.id, 4000);
+    if (status === 'complete') {
+      if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
+      AmbulanceData.setCurrentJob(null);
+      setTimeout(() => navigate('queue'), 800);
+      return;
+    }
+    renderJob();
+  }
+
+  function renderJob() {
+    const el = document.getElementById('screen-job');
+    if (!el) return;
+    const job = AmbulanceData.currentJob;
+    if (!job) {
+      el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🗺</div><div style="font-weight:700">No active response</div></div>`;
+      return;
+    }
+    el.innerHTML = `
+      <div id="incident-map"></div>
+      <div class="stat-row" style="margin-top:14px">
+        <div class="stat-box"><div class="stat-val" id="stat-eta">${job.unitETA ?? '—'}</div><div class="stat-key">Min ETA</div></div>
+        <div class="stat-box"><div class="stat-val" style="color:var(--red)">${(job.priority||'').toUpperCase()}</div><div class="stat-key">Priority</div></div>
+        <div class="stat-box"><div class="stat-val" style="font-size:0.75rem;color:var(--cyan)" id="stat-status">${statusLabel(job.status)}</div><div class="stat-key">Status</div></div>
+        <div class="stat-box"><div class="stat-val" style="font-size:0.7rem">${job.id}</div><div class="stat-key">Ref</div></div>
+      </div>
+      <div class="job-detail">
+        <div class="job-detail-row"><b>${job.type}</b></div>
+        <div class="job-detail-row">📍 ${job.location}</div>
+        <div class="job-detail-row">🧭 GPS: ${job.lat?.toFixed(5)}, ${job.lng?.toFixed(5)}</div>
+        ${job.civilianName ? `<div class="job-detail-row">👤 ${job.civilianName}${job.civilianPhone ? ' · ' + job.civilianPhone : ''}</div>` : ''}
+        ${job.notes ? `<div class="job-detail-row">📝 ${job.notes}</div>` : ''}
+      </div>
+      <div class="action-bar">
+        ${job.status === 'accepted' ? `<button class="btn btn-primary btn-full" onclick="AmbulanceApp.setStatus('en_route')">🚨 Depart — En Route</button>` : ''}
+        ${job.status === 'en_route' ? `<button class="btn btn-warning btn-full" onclick="AmbulanceApp.setStatus('on_scene')">📍 Mark On Scene</button>` : ''}
+        ${job.status === 'on_scene' ? `<button class="btn btn-success btn-full" onclick="AmbulanceApp.setStatus('complete')">✅ Complete Call</button>` : ''}
+      </div>`;
+    setTimeout(initMap, 60);
+  }
+
+  function statusLabel(s) {
+    return { accepted:'Accepted', en_route:'En Route', on_scene:'On Scene', complete:'Complete' }[s] || s;
+  }
+
+  function updateStatBar() {
+    const eta = document.getElementById('stat-eta');
+    if (eta && AmbulanceData.currentJob) eta.textContent = AmbulanceData.currentJob.unitETA ?? '—';
+  }
+
+  function initMap() {
+    const el = document.getElementById('incident-map');
+    if (!el || typeof L === 'undefined') return;
+    const job = AmbulanceData.currentJob;
+    if (!job) return;
+    if (map) { try { map.remove(); } catch(e){} map = null; }
+    const center = [job.unitLat || job.lat, job.unitLng || job.lng];
+    map = L.map('incident-map', { zoomControl:true, attributionControl:false }).setView(center, 13);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom:19 }).addTo(map);
+    incMarker = L.marker([job.lat, job.lng], { icon: L.divIcon({
+      html:'<div style="font-size:22px">🩺</div>', className:'', iconSize:[26,26], iconAnchor:[13,13] }) })
+      .addTo(map).bindPopup(job.type);
+    unitMarker = L.marker([job.unitLat || job.lat, job.unitLng || job.lng], { icon: L.divIcon({
+      html:'<div style="font-size:22px">🚑</div>', className:'', iconSize:[26,26], iconAnchor:[13,13] }) })
+      .addTo(map).bindPopup(AmbulanceData.crew.name);
+    routeLine = L.polyline(routeCoords.length ? routeCoords : [[job.lat,job.lng]], { color:'#ef4444', weight:3, dashArray:'8 6' }).addTo(map);
+    map.fitBounds(L.latLngBounds([[job.lat,job.lng],[job.unitLat||job.lat, job.unitLng||job.lng]]), { padding:[40,40] });
+  }
+
+  return {
+    showSignup, showLogin, doLogin, doSignup, endShift, navigate,
+    onNewCall, acceptCall, setStatus, showToast,
+  };
+})();
+
+document.addEventListener('DOMContentLoaded', () => {
+  ['login-name','login-pass'].forEach(id => {
+    const elm = document.getElementById(id);
+    if (elm) elm.addEventListener('keydown', e => { if (e.key === 'Enter') AmbulanceApp.doLogin(); });
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "geams-realtime-backend",
+  "version": "1.0.0",
+  "description": "Real-time WebSocket backend for GEAMS — replaces the localStorage-based GeamsSync with genuine cross-device sync, plus WebRTC call signaling relay and SMS notification plumbing.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
