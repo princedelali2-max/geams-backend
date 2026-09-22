@@ -175,6 +175,27 @@ const server = http.createServer((req, res) => {
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(404); res.end('Not found'); return; }
     const ext = path.extname(filePath);
+    if (ext === '.html') {
+      // Auto-inject this server's real token into every page it serves,
+      // overriding whatever placeholder value (usually a blank '') is
+      // sitting in the file. This is the single most common way real-time
+      // sync silently fails: the six HTML files get distributed/uploaded
+      // with window.GEAMS_AUTH_TOKEN left blank because it's easy to miss
+      // among six files, the server then correctly rejects the mismatched
+      // connection, and nothing syncs with no visible error anywhere.
+      // Since these pages are being served BY this exact server, it
+      // already knows the one correct value — no reason to trust a copy
+      // pasted by hand into six separate files when this server can just
+      // supply it directly, every time, correctly.
+      let html = data.toString('utf8');
+      html = html.replace(
+        /window\.GEAMS_AUTH_TOKEN\s*=\s*'[^']*';/,
+        `window.GEAMS_AUTH_TOKEN = ${JSON.stringify(AUTH_TOKEN)};`
+      );
+      res.writeHead(200, { 'Content-Type': MIME[ext] });
+      res.end(html);
+      return;
+    }
     res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
     res.end(data);
   });
