@@ -1805,6 +1805,14 @@ const CivilianApp = (() => {
     }
 
     const em = CivilianData.startEmergency(type);
+    // Wait for the connection attempt to actually settle (connected or
+    // genuinely offline) before deciding real-vs-demo — checking
+    // GeamsSync.available() synchronously here could catch the socket
+    // still mid-handshake (common right after app launch) and wrongly
+    // leave the fabricated demo officer name/ETA in place, showing a
+    // fake "dispatch" indication before any real Dispatch device is
+    // even connected.
+    await GeamsSync.ready;
     if (GeamsSync.available()) { em.officerName = null; em.officerBadge = null; em.officerETA = null; }
     startEmergencySync(em, details);
     // Flash topbar
@@ -1890,6 +1898,7 @@ const CivilianApp = (() => {
     }
 
     const em = CivilianData.startEmergency(type);
+    await GeamsSync.ready; // see confirmSOS() for why this must be awaited first
     if (GeamsSync.available()) { em.officerName = null; em.officerBadge = null; em.officerETA = null; }
     startEmergencySync(em, 'Silent SOS — audio/video recording active');
     const dot = document.getElementById('logo-dot');
