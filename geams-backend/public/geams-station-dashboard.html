@@ -2171,7 +2171,21 @@ const StationData = (() => {
     commanderRank:  'Superintendent',
     lat:  5.5502,
     lng: -0.2174,
-    jurisdictionRadiusM: 3000,
+    // ── REAL-TIME-TEST NOTE ── This was 3000 (a realistic 3km real-world
+    // jurisdiction). With real GPS now wired in, that meant any tester
+    // whose actual physical location during testing wasn't within 3km of
+    // this one hardcoded Accra Central point had every incident silently
+    // fail canViewIncident() — received and logged, but excluded from
+    // Incoming Alerts with no visible reason (now fixed to at least say
+    // so — see the 'Incident Outside Jurisdiction' toast in bindLive()).
+    // Widened intentionally for this prototype testing phase so incidents
+    // from wherever you're actually testing aren't filtered out by a
+    // jurisdiction boundary that has nothing to do with what's being
+    // tested right now (cross-device real-time sync). Set this back to a
+    // realistic value (3000–5000) once you're specifically testing real
+    // jurisdiction/geofencing behavior, or update lat/lng above to your
+    // actual test location instead if you'd rather keep a tight radius.
+    jurisdictionRadiusM: 20000000,
     hqNodeId:    'HQ-NODE-001',
     installedDate: '2024-03-15',
     shift:       'Day Shift (06:00 – 18:00)',
@@ -2655,6 +2669,21 @@ const StationApp = (() => {
     StationData.onUpdate((event, data) => {
       updateKPIs();
       if (event === 'new_incident') {
+        const inJurisdiction = StationData.canViewIncident(data);
+        if (!inJurisdiction) {
+          // ── REAL-TIME-TEST NOTE ── Previously this toasted/logged
+          // identically whether or not the incident was actually inside
+          // this station's jurisdiction — so an out-of-range incident
+          // (very possible when testing with real GPS from wherever you
+          // actually are, rather than this demo station's hardcoded
+          // Accra Central coordinates) would flash in the activity log
+          // and then silently never appear in Incoming Alerts, with no
+          // indication of why. Now it says so explicitly.
+          showToast('warning', '📍 Incident Outside Jurisdiction',
+            `${data.type} received from ${data.civilian || 'a civilian'}, ${Math.round(StationAuth.haversineMeters(StationData.station.lat, StationData.station.lng, data.lat, data.lng)/1000*10)/10} km away — outside this station's ${(StationData.station.jurisdictionRadiusM/1000)} km jurisdiction, so it will not appear in Incoming Alerts. See the note in station-dashboard's station object if this station's real coordinates need updating for testing.`,
+            9000);
+          return;
+        }
         const urg = data.priority === 'critical' ? 'error' : data.priority === 'high' ? 'warning' : 'info';
         showToast(urg, '🚨 New Incident — ' + data.priority.toUpperCase(),
           `${data.type} · ${data.location}`);
