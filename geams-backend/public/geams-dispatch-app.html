@@ -1116,7 +1116,7 @@ const RealCall = (() => {
     activeCallId = null; remoteUserId = null;
   }
 
-  async function start(toUserId, { video = false, onRemoteStream, onStatus } = {}) {
+  async function start(toUserId, { video = false, onRemoteStream, onLocalStream, onStatus } = {}) {
     if (!GeamsSync.available()) { onStatus && onStatus('unavailable'); return null; }
     teardown();
     remoteUserId = toUserId;
@@ -1134,6 +1134,7 @@ const RealCall = (() => {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video });
     } catch (e) { onStatus && onStatus('media-denied'); teardown(); return null; }
     localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+    if (onLocalStream) onLocalStream(localStream);
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -1143,7 +1144,7 @@ const RealCall = (() => {
   }
 
   // Accept a call that's already rung (see listen()'s onIncoming callback).
-  async function accept(fromUserId, offerPayload, { video = false, onRemoteStream, onStatus } = {}) {
+  async function accept(fromUserId, offerPayload, { video = false, onRemoteStream, onLocalStream, onStatus } = {}) {
     remoteUserId = fromUserId;
     activeCallId = offerPayload.callId;
     pc = new RTCPeerConnection({ iceServers: await getIceServers() });
@@ -1157,6 +1158,7 @@ const RealCall = (() => {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: video || !!offerPayload.hasVideo });
       localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+      if (onLocalStream) onLocalStream(localStream);
     } catch (e) { onStatus && onStatus('media-denied'); }
     await pc.setRemoteDescription({ type: 'offer', sdp: offerPayload.sdp });
     const answer = await pc.createAnswer();
@@ -2463,15 +2465,25 @@ const DispatchApp = (() => {
       return;
     }
     if (!GeamsSync.available()) { showToast('error', 'Not Connected', 'No real-time backend connection — cannot place a call'); return; }
-    showToast('info', '📞 Calling', 'Calling ' + (job.civilian || 'civilian') + '...');
+    showToast('info', '📹 Calling', 'Video calling ' + (job.civilian || 'civilian') + '...');
+    // ── REAL-TIME-TEST NOTE ── This used to omit `video: true`, so it was
+    // a voice-only call — matching the old fake button's phone icon, but
+    // not the actual requirement (real camera feeds between Civilian and
+    // Dispatch). RealCall.start's `video` flag is what makes it request
+    // this device's camera AND tell the civilian's side to turn theirs on
+    // too (via the offer's hasVideo flag) — without it, no video track
+    // ever exists on either end, which is exactly the reported symptom:
+    // permission granted, connection succeeds, but no video appears.
     RealCall.start(job.civilianId, {
+      video: true,
       onStatus: (s) => {
         if (s === 'unavailable') showToast('error', 'Not Connected', 'No real-time backend connection');
-        else if (s === 'media-denied') showToast('error', 'Microphone Blocked', 'Allow microphone access to place calls');
-        else if (s === 'connected') showToast('success', '📞 Connected', job.civilian || 'Civilian');
+        else if (s === 'media-denied') showToast('error', 'Camera/Microphone Blocked', 'Allow camera and microphone access to place calls');
+        else if (s === 'connected') showToast('success', '📹 Connected', job.civilian || 'Civilian');
         else if (s === 'failed' || s === 'disconnected') showToast('warning', 'Call Connection Lost', '');
       },
-      onRemoteStream: attachRemoteAudio,
+      onRemoteStream: attachRemoteMedia,
+      onLocalStream: attachLocalPreview,
     });
   }
 
@@ -2479,16 +2491,18 @@ const DispatchApp = (() => {
     const off = DispatchData.officer;
     const stationUserId = 'STATION-' + off.controlRoomId; // must match GeamsSync.registerUserId(...) called by the Station Dashboard app for this LCR
     if (!GeamsSync.available()) { showToast('error', 'Not Connected', 'No real-time backend connection — cannot place a call'); return; }
-    showToast('info', mode === 'emergency' ? '🆘 Opening Emergency Channel' : '📞 Calling', off.controlRoomName || 'Control Room');
+    showToast('info', mode === 'emergency' ? '🆘 Opening Emergency Channel' : '📹 Calling', off.controlRoomName || 'Control Room');
     RealCall.start(stationUserId, {
+      video: true,
       onStatus: (s) => {
         if (s === 'unavailable') showToast('error', 'Not Connected', 'No real-time backend connection');
-        else if (s === 'media-denied') showToast('error', 'Microphone Blocked', 'Allow microphone access to place calls');
-        else if (s === 'connected') showToast('success', '📞 Connected', off.controlRoomName || 'Control Room');
+        else if (s === 'media-denied') showToast('error', 'Camera/Microphone Blocked', 'Allow camera and microphone access to place calls');
+        else if (s === 'connected') showToast('success', '📹 Connected', off.controlRoomName || 'Control Room');
         else if (s === 'unreachable') showToast('warning', 'Station Not Connected', 'No one at the LCR is online right now');
         else if (s === 'failed' || s === 'disconnected') showToast('warning', 'Call Connection Lost', '');
       },
-      onRemoteStream: attachRemoteAudio,
+      onRemoteStream: attachRemoteMedia,
+      onLocalStream: attachLocalPreview,
     });
   }
 
@@ -2496,6 +2510,35 @@ const DispatchApp = (() => {
     let audioEl = document.getElementById('realcall-remote-audio');
     if (!audioEl) { audioEl = document.createElement('audio'); audioEl.id = 'realcall-remote-audio'; audioEl.autoplay = true; document.body.appendChild(audioEl); }
     audioEl.srcObject = stream;
+  }
+
+  function attachRemoteMedia(stream) {
+    const hasVideo = stream.getVideoTracks().length > 0;
+    let el = document.getElementById('realcall-remote-media');
+    if (!el) {
+      el = document.createElement(hasVideo ? 'video' : 'audio');
+      el.id = 'realcall-remote-media';
+      el.autoplay = true;
+      if (hasVideo) { el.playsInline = true; el.style.cssText = 'position:fixed;top:60px;right:12px;width:160px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4)'; }
+      else el.style.display = 'none';
+      document.body.appendChild(el);
+    }
+    el.srcObject = stream;
+  }
+
+  function attachLocalPreview(stream) {
+    // Small self-view so the officer can confirm their own camera is
+    // actually being captured and sent, not just trust that it is.
+    if (!stream.getVideoTracks().length) return;
+    let el = document.getElementById('realcall-local-preview');
+    if (!el) {
+      el = document.createElement('video');
+      el.id = 'realcall-local-preview';
+      el.autoplay = true; el.muted = true; el.playsInline = true;
+      el.style.cssText = 'position:fixed;top:60px;right:180px;width:110px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4);transform:scaleX(-1)';
+      document.body.appendChild(el);
+    }
+    el.srcObject = stream;
   }
 
   function captureWitnessStatement() {
@@ -3317,14 +3360,11 @@ const DispatchApp = (() => {
     GeamsSync.registerUserId(off.id);
     RealCall.listen({
       onIncoming: (fromUserId, offer) => {
-        showToast('info', '📞 Incoming Call', 'Connecting to ' + fromUserId + '...', 4000);
+        showToast('info', offer.hasVideo ? '📹 Incoming Call' : '📞 Incoming Call', 'Connecting to ' + fromUserId + '...', 4000);
         RealCall.accept(fromUserId, offer, {
-          onStatus: (s) => { if (s === 'connected') showToast('success', '📞 Call Connected', fromUserId); },
-          onRemoteStream: (stream) => {
-            let audioEl = document.getElementById('realcall-remote-audio');
-            if (!audioEl) { audioEl = document.createElement('audio'); audioEl.id = 'realcall-remote-audio'; audioEl.autoplay = true; document.body.appendChild(audioEl); }
-            audioEl.srcObject = stream;
-          },
+          onStatus: (s) => { if (s === 'connected') showToast('success', offer.hasVideo ? '📹 Call Connected' : '📞 Call Connected', fromUserId); },
+          onRemoteStream: attachRemoteMedia,
+          onLocalStream: attachLocalPreview,
         });
       },
       onEnded: () => showToast('info', 'Call Ended', ''),
