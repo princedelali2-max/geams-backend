@@ -47,6 +47,9 @@ const PORT = process.env.PORT || 8080;
 const AUTH_TOKEN = process.env.GEAMS_AUTH_TOKEN || '';
 const DATA_FILE = process.env.GEAMS_DATA_FILE || path.join(__dirname, 'geams-data.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const UPLOADS_DIR = process.env.GEAMS_UPLOADS_DIR || path.join(__dirname, 'uploads');
+const MAX_UPLOAD_BYTES = parseInt(process.env.GEAMS_MAX_UPLOAD_BYTES, 10) || 50 * 1024 * 1024; // 50MB — generous for a phone photo/short video clip, not for much more
+try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
 
 if (!AUTH_TOKEN) {
   console.warn('[geams-backend] WARNING: GEAMS_AUTH_TOKEN is not set — anyone who finds this ' +
@@ -131,8 +134,164 @@ async function sendSms(toPhone, text) {
   return { configured: false, reason: 'No SMS provider wired in — see sendSms() in server.js' };
 }
 
+
+/* ────────────────────────────────────────────────────────────────────
+   MEDIA UPLOAD — real evidence photos/video/audio/PDF from devices.
+
+   Before this, a captured photo or body-cam recording stayed on the
+   device that took it (an in-browser blob URL nobody else could open).
+   Now: POST the raw file here, it's stored on disk, and a reference is
+   appended to the shared key `incident:{incidentId}:evidence`, which
+   pushes instantly to every LCR/HQ/Dispatch watching that incident —
+   the same real-time mechanism as everything else, no separate channel.
+
+   Safety choices worth knowing about:
+   - Only image/video/audio/PDF are accepted. SVG and HTML are refused on
+     purpose: served from the same origin as the apps, an uploaded SVG or
+     HTML file could run script with access to the auth token.
+   - Files are served with nosniff + a sandboxing CSP, and the stored
+     content type is the whitelisted one, never re-derived from the file.
+   - Media IDs are validated as UUIDs, so a crafted id can't walk the
+     filesystem.
+   - Size is capped (default 50MB) and enforced while streaming, not just
+     from the Content-Length header, which a client can lie about.
+──────────────────────────────────────────────────────────────────── */
+const ALLOWED_MEDIA = /^(image|video|audio)\/[a-z0-9.+-]+$|^application\/pdf$/;
+const EXT_BY_TYPE = {
+  'image/jpeg':'.jpg', 'image/png':'.png', 'image/webp':'.webp', 'image/gif':'.gif', 'image/heic':'.heic', 'image/heif':'.heif',
+  'video/mp4':'.mp4', 'video/webm':'.webm', 'video/quicktime':'.mov', 'video/3gpp':'.3gp',
+  'audio/webm':'.webm', 'audio/mp4':'.m4a', 'audio/mpeg':'.mp3', 'audio/ogg':'.ogg', 'audio/wav':'.wav', 'audio/x-m4a':'.m4a',
+  'application/pdf':'.pdf',
+};
+const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+
+function rejectAndClose(req, res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Connection': 'close' });
+  res.end(body, () => { try { req.destroy(); } catch (e) {} });
+}
+
+// Push a new value for `key` to every socket currently watching it —
+// the same fan-out the WebSocket 'set' handler does, reused here so an
+// upload lands on LCR/HQ screens instantly instead of on next refresh.
+function fanoutUpdate(key, value) {
+  for (const sock of watchersFor(key)) {
+    if (sock.readyState === sock.OPEN) sock.send(JSON.stringify({ type:'update', key, value }));
+  }
+}
+
+function handleMediaUpload(req, res, url) {
+  const q = url.searchParams;
+  if (AUTH_TOKEN && q.get('token') !== AUTH_TOKEN) return rejectAndClose(req, res, 401, { ok:false, error:'unauthorized' });
+
+  const contentType = String(q.get('contentType') || req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (!ALLOWED_MEDIA.test(contentType) || contentType.includes('svg')) {
+    return rejectAndClose(req, res, 415, { ok:false, error:'unsupported media type — only image, video, audio and PDF are accepted' });
+  }
+  const declared = parseInt(req.headers['content-length'] || '0', 10);
+  if (declared > MAX_UPLOAD_BYTES) {
+    return rejectAndClose(req, res, 413, { ok:false, error:`file too large (limit ${Math.round(MAX_UPLOAD_BYTES/1024/1024)}MB)` });
+  }
+
+  const id = crypto.randomUUID();
+  const storedName = id + (EXT_BY_TYPE[contentType] || '.bin');
+  const dest = path.join(UPLOADS_DIR, storedName);
+  const out = fs.createWriteStream(dest);
+  let bytes = 0, done = false;
+
+  const fail = (code, obj) => {
+    if (done) return; done = true;
+    req.unpipe(out); out.destroy();
+    fs.unlink(dest, () => {});
+    rejectAndClose(req, res, code, obj);
+  };
+
+  req.on('data', (chunk) => {
+    bytes += chunk.length;
+    if (bytes > MAX_UPLOAD_BYTES) fail(413, { ok:false, error:`file too large (limit ${Math.round(MAX_UPLOAD_BYTES/1024/1024)}MB)` });
+  });
+  req.on('aborted', () => { if (!done) { done = true; out.destroy(); fs.unlink(dest, () => {}); } });
+  req.on('error', () => { if (!done) { done = true; out.destroy(); fs.unlink(dest, () => {}); } });
+  out.on('error', () => fail(500, { ok:false, error:'could not store file' }));
+
+  out.on('finish', () => {
+    if (done) return; done = true;
+    if (bytes === 0) { fs.unlink(dest, () => {}); return sendJSON(res, 400, { ok:false, error:'empty file' }); }
+
+    const clip = (v, n) => String(v || '').slice(0, n);
+    const meta = {
+      id, url: '/api/media/' + id, contentType, size: bytes,
+      filename: clip(q.get('filename'), 200), type: clip(q.get('type'), 80),
+      notes: clip(q.get('notes'), 500), uploadedBy: clip(q.get('uploadedBy'), 100),
+      incidentId: clip(q.get('incidentId'), 100), uploadedAt: new Date().toISOString(),
+    };
+    store.set('media:' + id, Object.assign({ file: storedName }, meta));
+
+    if (meta.incidentId) {
+      const listKey = 'incident:' + meta.incidentId + ':evidence';
+      const list = Array.isArray(store.get(listKey)) ? store.get(listKey) : [];
+      list.push(meta);
+      store.set(listKey, list);
+      fanoutUpdate(listKey, list);
+    }
+    persist();
+    console.log(`[geams-backend] media stored: ${storedName} (${bytes} bytes, ${contentType}) incident=${meta.incidentId || '-'}`);
+    sendJSON(res, 200, { ok:true, mediaId: id, url: meta.url, size: bytes, contentType });
+  });
+
+  req.pipe(out);
+}
+
+function handleMediaGet(req, res, url, id) {
+  if (AUTH_TOKEN && url.searchParams.get('token') !== AUTH_TOKEN) return sendJSON(res, 401, { ok:false, error:'unauthorized' });
+  if (!UUID_RE.test(id)) { res.writeHead(404); res.end('Not found'); return; }
+  const meta = store.get('media:' + id);
+  if (!meta || !meta.file) { res.writeHead(404); res.end('Not found'); return; }
+
+  const filePath = path.join(UPLOADS_DIR, path.basename(meta.file));
+  fs.stat(filePath, (err, st) => {
+    if (err) { res.writeHead(404); res.end('File no longer available'); return; }
+    const headers = {
+      'Content-Type': meta.contentType,
+      'Accept-Ranges': 'bytes',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "sandbox; default-src 'none'",
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'Cache-Control': 'private, max-age=3600',
+    };
+    let start = 0, end = st.size - 1, status = 200;
+    const range = req.headers.range;
+    if (range && st.size > 0) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (m && (m[1] !== '' || m[2] !== '')) {
+        if (m[1] === '') { start = Math.max(0, st.size - parseInt(m[2], 10)); }
+        else { start = parseInt(m[1], 10); if (m[2] !== '') end = Math.min(parseInt(m[2], 10), st.size - 1); }
+        if (start > end || start >= st.size) {
+          res.writeHead(416, { 'Content-Range': `bytes */${st.size}` }); res.end(); return;
+        }
+        status = 206;
+        headers['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
+      }
+    }
+    headers['Content-Length'] = st.size === 0 ? 0 : (end - start + 1);
+    res.writeHead(status, headers);
+    if (st.size === 0) { res.end(); return; }
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  });
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
+
+  if (url.pathname.startsWith('/api/')) {
+    // Lets the apps call these endpoints even when an HTML file is opened
+    // from somewhere other than this server (e.g. a local copy pointed at
+    // the deployed URL). Every route below still requires the token.
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  }
 
   if (url.pathname === '/api/notify-contact' && req.method === 'POST') {
     let body = '';
@@ -152,6 +311,12 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/api/health') return sendJSON(res, 200, { ok:true, keys: store.size, clients: wss.clients.size });
+
+  if (url.pathname === '/api/media/upload' && req.method === 'POST') return handleMediaUpload(req, res, url);
+  {
+    const m = url.pathname.match(/^\/api\/media\/([^\/]+)$/);
+    if (m && req.method === 'GET') return handleMediaGet(req, res, url, m[1]);
+  }
 
   // Friendly short links for each app — so a civilian, officer, or
   // commander just needs "your-server.onrender.com/civilian" rather than
