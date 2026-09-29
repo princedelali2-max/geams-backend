@@ -74,7 +74,11 @@ minutes, no card.
   will be gone (in-progress ones being actively synced won't be affected
   mid-session). Completely fine for testing the *real-time communication
   itself*, which is the point at this stage — worth knowing if you're
-  also relying on it as a permanent incident log.
+  also relying on it as a permanent incident log. **This applies to
+  uploaded evidence files too** (`/api/media/upload` — body cam footage,
+  scene photos): they're saved to disk next to the data file, so they
+  survive a normal restart but not a spin-down. Files are capped at 50MB
+  each by default (`GEAMS_MAX_UPLOAD_BYTES` to change it).
 - **750 free hours/month** — more than enough for one service running
   continuously all month (a month has ~730 hours).
 
