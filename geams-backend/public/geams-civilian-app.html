@@ -829,6 +829,42 @@ const GeamsSync = (() => {
     };
   }
 
+  /* ── MEDIA UPLOAD ─────────────────────────────────────────────────────
+     POSTs a real File/Blob (photo, video, audio, PDF) to the backend's
+     /api/media/upload. The server stores it and appends a reference to the
+     shared key `incident:{incidentId}:evidence`, which every LCR/HQ/Dispatch
+     device watching that incident receives live. Returns {ok:true, path,
+     mediaId, size, contentType} or {ok:false, reason} — never pretends. */
+  function httpBase() {
+    if (!GEAMS_BACKEND_URL) return null;
+    return GEAMS_BACKEND_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\?.*$/, '').replace(/\/ws\/?$/, '');
+  }
+  async function uploadMedia(file, meta) {
+    meta = meta || {};
+    const base = httpBase();
+    if (!base) return { ok:false, reason:'No backend configured' };
+    if (!file) return { ok:false, reason:'No file to upload' };
+    const contentType = String(file.type || meta.contentType || '').split(';')[0] || 'application/octet-stream';
+    const qs = new URLSearchParams({
+      token: GEAMS_AUTH_TOKEN, incidentId: meta.incidentId || '', type: meta.type || '',
+      filename: meta.filename || file.name || '', notes: meta.notes || '', uploadedBy: meta.uploadedBy || '', contentType,
+    });
+    try {
+      const res = await fetch(base + '/api/media/upload?' + qs.toString(), { method: 'POST', headers: { 'Content-Type': contentType }, body: file });
+      let data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (res.ok && data.ok) return { ok:true, mediaId: data.mediaId, path: data.url, size: data.size, contentType: data.contentType };
+      return { ok:false, reason: data.error || ('Upload failed (HTTP ' + res.status + ')') };
+    } catch (e) { return { ok:false, reason:'Network error — the upload did not complete' }; }
+  }
+  // Full authorised URL for a stored file (e.g. an <img src> or <video src>),
+  // given the relative path the server returned (/api/media/{id}).
+  function mediaUrl(path) {
+    const base = httpBase();
+    if (!base || !path) return null;
+    return base + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
+  }
+
   /* ── CALL SIGNALING (WebRTC) ──────────────────────────────────────────
      A thin relay, not stored state: registerUserId ties this socket to
      a real identity (civilian id / officer badge / station id) so the
@@ -847,7 +883,7 @@ const GeamsSync = (() => {
   return {
     available, getShared, setShared, mergeShared, watch,
     ready: readyPromise, get mode() { return mode; }, get clientId() { return CLIENT_ID; },
-    registerUserId, onSignal, sendSignal,
+    registerUserId, onSignal, sendSignal, uploadMedia, mediaUrl,
   };
 })();
 
@@ -923,7 +959,7 @@ const RealCall = (() => {
   }
 
   // Accept a call that's already rung (see listen()'s onIncoming callback).
-  async function accept(fromUserId, offerPayload, { video = false, onRemoteStream, onStatus } = {}) {
+  async function accept(fromUserId, offerPayload, { video = false, onRemoteStream, onLocalStream, onStatus } = {}) {
     remoteUserId = fromUserId;
     activeCallId = offerPayload.callId;
     pc = new RTCPeerConnection({ iceServers: await getIceServers() });
@@ -937,6 +973,7 @@ const RealCall = (() => {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: video || !!offerPayload.hasVideo });
       localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+      if (onLocalStream) onLocalStream(localStream);
     } catch (e) { onStatus && onStatus('media-denied'); }
     await pc.setRemoteDescription({ type: 'offer', sdp: offerPayload.sdp });
     const answer = await pc.createAnswer();
@@ -1049,7 +1086,7 @@ async function submitCivilianReport(opts) {
       m = m || {};
       m[id] = {
         id, type: opts.type, priority: opts.priority || 'medium', status: 'new',
-        location: opts.location || CivilianData.user.address, lat: civLat, lng: civLng,
+        location: opts.location || CivilianData.displayLocation(), lat: civLat, lng: civLng,
         civilianId: opts.anonymous ? null : CivilianData.user.id,
         civilianName: opts.anonymous ? 'Anonymous' : CivilianData.user.name,
         civilianPhone: opts.anonymous ? null : CivilianData.user.phone,
@@ -1097,6 +1134,11 @@ function watchReportResolution(id, stationId, isHqHandled, hasLiveEvidence) {
 
 function startEmergencySync(em, notes, skipCreate) {
   if (!skipCreate) {
+    // Real coordinates immediately — an emergency must never wait on a
+    // third-party geocoding network call before reaching the LCR. The
+    // human-readable address (if reverse geocoding succeeds) arrives a
+    // moment later as a background patch to the same record, below.
+    const immediateLocation = CivilianData.formatCoords(em.lat, em.lng);
     GeamsSync.mergeShared('lcr:' + em.stationId + ':incidents', {}, (m) => {
       m = m || {};
       // Never overwrite an existing record — defensive no-op if this ever
@@ -1104,7 +1146,7 @@ function startEmergencySync(em, notes, skipCreate) {
       if (m[em.id]) return m;
       m[em.id] = {
         id: em.id, type: em.type, priority: 'critical', status: 'new',
-        location: CivilianData.user.address, lat: em.lat, lng: em.lng,
+        location: immediateLocation, lat: em.lat, lng: em.lng,
         civilianId: CivilianData.user.id, civilianName: CivilianData.user.name,
         civilianPhone: CivilianData.user.phone, civilianLat: em.lat, civilianLng: em.lng,
         createdAt: em.startTime.toISOString(), source: 'civilian-app',
@@ -1113,6 +1155,17 @@ function startEmergencySync(em, notes, skipCreate) {
         notes: notes || '', resolvedAt: null,
       };
       return m;
+    });
+    // Background: once a real street address resolves, patch it in so
+    // LCR/Dispatch/HQ see something more useful than raw coordinates —
+    // never blocks or delays the dispatch above.
+    CivilianData.reverseGeocode(em.lat, em.lng).then((address) => {
+      if (!address) return;
+      GeamsSync.mergeShared('lcr:' + em.stationId + ':incidents', {}, (m) => {
+        m = m || {};
+        if (m[em.id]) m[em.id].location = address;
+        return m;
+      });
     });
   }
   if (_syncStopIncident) _syncStopIncident();
@@ -1536,6 +1589,51 @@ const CivilianData = (() => {
     return { lat: user.gpsLat || user.lat, lng: user.gpsLng || user.lng };
   }
 
+  /* ── REAL-TIME-TEST NOTE ── There was no reverse geocoding anywhere in
+     this app — every "Your Current Location" field and every incident's
+     `location` string always defaulted to user.address, the civilian's
+     static REGISTERED home address, even when real GPS had a fix on
+     somewhere completely different. This is what showed a fixed "14
+     Oxford Street, Osu, Accra" regardless of where the device actually
+     was. Fixed by wiring in real reverse geocoding (OpenStreetMap
+     Nominatim — free, no API key, suitable for prototype-scale use) with
+     an immediate coordinate-based string as a fallback so a real
+     emergency is never delayed waiting on a network geocoding call. */
+  let geocodeCache = null; // { lat, lng, address, at }
+  function formatCoords(lat, lng) {
+    if (lat === undefined || lng === undefined) return 'Location unavailable';
+    return `${Math.abs(lat).toFixed(4)}°${lat >= 0 ? 'N' : 'S'}, ${Math.abs(lng).toFixed(4)}°${lng >= 0 ? 'E' : 'W'} (GPS)`;
+  }
+  async function reverseGeocode(lat, lng) {
+    if (lat === undefined || lng === undefined) return null;
+    // Cache hit if we've already geocoded within ~30m of this exact spot
+    // recently — avoids hammering the free service on every GPS tick.
+    if (geocodeCache && haversineM(lat, lng, geocodeCache.lat, geocodeCache.lng) < 30 && Date.now() - geocodeCache.at < 5 * 60 * 1000) {
+      return geocodeCache.address;
+    }
+    try {
+      const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`);
+      const data = await res.json();
+      const address = data && data.display_name ? data.display_name : null;
+      if (address) geocodeCache = { lat, lng, address, at: Date.now() };
+      return address;
+    } catch (e) {
+      console.warn('[reverseGeocode] failed, falling back to coordinates:', e);
+      return null;
+    }
+  }
+  // Best current descriptor available RIGHT NOW, synchronously — never
+  // blocks on a network call. Prefers a recently cached real address,
+  // then real GPS coordinates, and only falls back to the static
+  // registered address (clearly labeled as such) if GPS was never
+  // acquired at all.
+  function displayLocation() {
+    const { lat, lng } = currentLatLng();
+    if (geocodeCache && lat !== undefined && haversineM(lat, lng, geocodeCache.lat, geocodeCache.lng) < 30) return geocodeCache.address;
+    if (user.gpsLat !== undefined) return formatCoords(lat, lng);
+    return user.address + ' (registered address — real GPS not yet acquired)';
+  }
+
   // Used when this civilian's report matches an EXISTING active incident at
   // the same location (see findNearbyActiveIncident) — links this device to
   // that incident instead of creating a duplicate. Officer/ETA fields are
@@ -1569,6 +1667,7 @@ const CivilianData = (() => {
     user, activeEmergency: () => activeEmergency,
     incidentHistory, chatHistory, safeRoutes,
     startEmergency, startLinkedEmergency, stopEmergency, getContactAlerts, notifyEmergencyContacts,
+    displayLocation, reverseGeocode, formatCoords,
     rnd, fmt, fmtDate, onUpdate, emit, startGPS, stopGPS, nearestStation, currentLatLng,
     loadAccount, saveAccount, registerUser, haversineM,
     loadPendingReports, addPendingReport, resolvePendingReport, getPendingReports, dismissReport,
@@ -1965,7 +2064,7 @@ const CivilianApp = (() => {
         </div>
       </div>
       <div class="form-group"><label class="form-label">Your Current Location</label>
-        <input class="form-input" value="${CivilianData.user.address}" placeholder="Confirm your location"></div>
+        <input class="form-input" value="${CivilianData.displayLocation()}" placeholder="Confirm your location"></div>
       <div class="form-group"><label class="form-label">Message to Contacts (optional)</label>
         <textarea class="form-textarea" rows="2" placeholder="e.g. I am at home and safe."></textarea></div>`,
       `<button class="btn btn-ghost" onclick="CivilianApp.closeSheet()">Cancel</button>
@@ -2374,7 +2473,7 @@ const CivilianApp = (() => {
       <div class="form-group"><label class="form-label">Officer Name / Badge (if known)</label>
         <input class="form-input" id="ph-officer" placeholder="Leave blank if unknown"></div>
       <div class="form-group"><label class="form-label">Location</label>
-        <input class="form-input" id="ph-location" value="${CivilianData.user.address}"></div>
+        <input class="form-input" id="ph-location" value="${CivilianData.displayLocation()}"></div>
       <div class="form-group"><label class="form-label">What Happened</label>
         <textarea class="form-textarea" id="ph-details" rows="3" placeholder="Describe the incident — what was said or done, when, and who else was present..."></textarea></div>`,
       `<button class="btn btn-ghost" onclick="CivilianApp.closeHarassmentSheet()">Cancel</button>
@@ -2473,7 +2572,7 @@ const CivilianApp = (() => {
           <option>Group gathering — suspicious</option>
         </select></div>
       <div class="form-group"><label class="form-label">Your Current Location</label>
-        <input class="form-input" id="cw-location" value="${CivilianData.user.address}"></div>
+        <input class="form-input" id="cw-location" value="${CivilianData.displayLocation()}"></div>
       <div class="form-group"><label class="form-label">Description</label>
         <textarea class="form-textarea" id="cw-description" rows="2" placeholder="Describe what you are seeing..."></textarea></div>`,
       `<button class="btn btn-ghost" onclick="CivilianApp.closeSheet()">Cancel</button>
@@ -2961,11 +3060,11 @@ const CivilianApp = (() => {
   }
   function acceptCall(fromUserId, offer) {
     closeSheet();
-    showToast('info', '📞 Connecting', fromUserId);
+    showToast('info', offer.hasVideo ? '📹 Connecting' : '📞 Connecting', fromUserId);
     RealCall.accept(fromUserId, offer, {
       onStatus: (s) => {
         if (s === 'media-denied') showToast('error', 'Camera/Mic Blocked', 'Allow access to answer the call');
-        else if (s === 'connected') showToast('success', '📞 Connected', fromUserId);
+        else if (s === 'connected') showToast('success', offer.hasVideo ? '📹 Connected' : '📞 Connected', fromUserId);
       },
       onRemoteStream: (stream) => {
         let el = document.getElementById('realcall-remote-media');
@@ -2975,6 +3074,18 @@ const CivilianApp = (() => {
           el.id = 'realcall-remote-media'; el.autoplay = true;
           if (hasVideo) { el.playsInline = true; el.style.cssText = 'position:fixed;bottom:80px;right:12px;width:140px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4)'; }
           else el.style.display = 'none';
+          document.body.appendChild(el);
+        }
+        el.srcObject = stream;
+      },
+      onLocalStream: (stream) => {
+        if (!stream.getVideoTracks().length) return;
+        let el = document.getElementById('realcall-local-preview');
+        if (!el) {
+          el = document.createElement('video');
+          el.id = 'realcall-local-preview';
+          el.autoplay = true; el.muted = true; el.playsInline = true;
+          el.style.cssText = 'position:fixed;bottom:80px;right:160px;width:100px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4);transform:scaleX(-1)';
           document.body.appendChild(el);
         }
         el.srcObject = stream;
@@ -3010,15 +3121,32 @@ const CivilianApp = (() => {
 
   async function fulfillPhotoRequest(incidentId, requestedAt) {
     const input = document.getElementById('photo-request-input');
-    if (!input || !input.files || !input.files[0]) { showToast('error', 'No Photo Selected', ''); return; }
-    // Real capture confirmed — mark fulfilled. (Actually uploading the
-    // image file to the incident's evidence store is a file-transfer
-    // concern, not a GeamsSync key/value one — wire it to whatever
-    // MediaAsset upload endpoint the deployed backend exposes, per
-    // geams-realtime-backend-spec.md §2's MediaAsset entity.)
-    await GeamsSync.mergeShared('incident:' + incidentId + ':photo_request', {}, (m) => { m = m || {}; m.fulfilled = true; m.fulfilledAt = Date.now(); return m; });
+    if (!input || !input.files || !input.files[0]) { showToast('error', 'No Photo Selected', 'Take or choose a photo first'); return; }
+    const file = input.files[0];
+    if (!GeamsSync.available()) { showToast('error', 'Not Connected', 'No connection to the control room — the photo was not sent. Try again when you are back online.', 6000); return; }
+
+    // ── REAL-TIME-TEST NOTE ── This used to just flip `fulfilled:true` and
+    // toast "Photo Sent — Delivered to the control room" without ever
+    // sending the photo anywhere. It now uploads the actual file first, and
+    // only reports success (and marks the request fulfilled) once the
+    // server has confirmed it stored the file. On failure the sheet stays
+    // open so the civilian can simply try again.
+    const btn = document.querySelector('#sheet-footer .btn-primary, .sheet-footer .btn-primary');
+    if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+    const r = await GeamsSync.uploadMedia(file, {
+      incidentId, type: 'Photo requested by control room', filename: file.name,
+      uploadedBy: CivilianData.user.id,
+    });
+    if (!r.ok) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Send Photo'; }
+      showToast('error', 'Photo Not Sent', r.reason + ' — please try again', 7000);
+      return;
+    }
+    await GeamsSync.mergeShared('incident:' + incidentId + ':photo_request', {}, (m) => {
+      m = m || {}; m.fulfilled = true; m.fulfilledAt = Date.now(); m.mediaPath = r.path; return m;
+    });
     closeSheet();
-    showToast('success', 'Photo Sent', 'Delivered to the control room');
+    showToast('success', 'Photo Sent', 'The control room has received your photo');
   }
 
   function confirmLogout() {
