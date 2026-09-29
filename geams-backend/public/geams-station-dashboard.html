@@ -1541,6 +1541,42 @@ const GeamsSync = (() => {
     };
   }
 
+  /* ── MEDIA UPLOAD ─────────────────────────────────────────────────────
+     POSTs a real File/Blob (photo, video, audio, PDF) to the backend's
+     /api/media/upload. The server stores it and appends a reference to the
+     shared key `incident:{incidentId}:evidence`, which every LCR/HQ/Dispatch
+     device watching that incident receives live. Returns {ok:true, path,
+     mediaId, size, contentType} or {ok:false, reason} — never pretends. */
+  function httpBase() {
+    if (!GEAMS_BACKEND_URL) return null;
+    return GEAMS_BACKEND_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\?.*$/, '').replace(/\/ws\/?$/, '');
+  }
+  async function uploadMedia(file, meta) {
+    meta = meta || {};
+    const base = httpBase();
+    if (!base) return { ok:false, reason:'No backend configured' };
+    if (!file) return { ok:false, reason:'No file to upload' };
+    const contentType = String(file.type || meta.contentType || '').split(';')[0] || 'application/octet-stream';
+    const qs = new URLSearchParams({
+      token: GEAMS_AUTH_TOKEN, incidentId: meta.incidentId || '', type: meta.type || '',
+      filename: meta.filename || file.name || '', notes: meta.notes || '', uploadedBy: meta.uploadedBy || '', contentType,
+    });
+    try {
+      const res = await fetch(base + '/api/media/upload?' + qs.toString(), { method: 'POST', headers: { 'Content-Type': contentType }, body: file });
+      let data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (res.ok && data.ok) return { ok:true, mediaId: data.mediaId, path: data.url, size: data.size, contentType: data.contentType };
+      return { ok:false, reason: data.error || ('Upload failed (HTTP ' + res.status + ')') };
+    } catch (e) { return { ok:false, reason:'Network error — the upload did not complete' }; }
+  }
+  // Full authorised URL for a stored file (e.g. an <img src> or <video src>),
+  // given the relative path the server returned (/api/media/{id}).
+  function mediaUrl(path) {
+    const base = httpBase();
+    if (!base || !path) return null;
+    return base + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
+  }
+
   /* ── CALL SIGNALING (WebRTC) ──────────────────────────────────────────
      A thin relay, not stored state: registerUserId ties this socket to
      a real identity (civilian id / officer badge / station id) so the
@@ -1559,7 +1595,7 @@ const GeamsSync = (() => {
   return {
     available, getShared, setShared, mergeShared, watch,
     ready: readyPromise, get mode() { return mode; }, get clientId() { return CLIENT_ID; },
-    registerUserId, onSignal, sendSignal,
+    registerUserId, onSignal, sendSignal, uploadMedia, mediaUrl,
   };
 })();
 
@@ -2369,18 +2405,14 @@ const StationData = (() => {
   }
 
   /* ── AUDIT LOG ── */
-  const auditLog = [
-    {time:'14:32:11', source:'CIVILIAN-APP',  text:'<strong>Incident INC-1001</strong> created — Kidnapping, Osu, Accra'},
-    {time:'14:30:58', source:'DISPATCH',       text:'<strong>Sgt. K. Asante</strong> dispatched to INC-1001 — ETA 6 min'},
-    {time:'14:29:44', source:'HQ-SYNC',        text:'Watchlist sync received — <strong>847 entries</strong> updated'},
-    {time:'14:27:10', source:'INCIDENT',       text:'INC-0998 marked <strong>resolved</strong> by Insp. A. Boateng'},
-    {time:'14:25:33', source:'COMMS',          text:'Video call initiated with civilian <strong>Kwame Asante</strong>'},
-    {time:'14:22:08', source:'EVIDENCE',       text:'3 photos uploaded for INC-1001 by <strong>Cpl. E. Mensah</strong>'},
-    {time:'14:20:55', source:'HQ-BROADCAST',   text:'National watchlist sync received from <strong>HQ-NODE-001</strong>'},
-    {time:'14:18:29', source:'STATION',        text:'Shift handover completed — <strong>Day Shift</strong> active'},
-    {time:'14:15:44', source:'AUTH',           text:'<strong>Supt. K. Mensah</strong> logged in — session started'},
-    {time:'14:12:01', source:'BACKUP',         text:'Mutual aid requested from <strong>GH-GA-ACC-001</strong>'},
-  ];
+  // ── REAL-TIME-TEST NOTE ── This used to be seeded with ten fabricated
+  // entries ("Incident INC-1001 created — Kidnapping, Osu, Accra", "Sgt.
+  // K. Asante dispatched...", etc.) that never happened — displayed every
+  // time the dashboard loads, which is what looked like the log
+  // "auto-generating" content. Starts empty now; every entry from here
+  // on is written only by a real action (authorizeExternalIncident,
+  // revokeExternalAccess, logActivity, or a real call connecting).
+  const auditLog = [];
 
   /* ── PERFORMANCE STATS ── */
   const stats = {
@@ -4341,8 +4373,16 @@ const StationMap = (() => {
       addIncidentMarker(inc);
     });
 
-    // Start officer drift
-    startOfficerDrift();
+    // ── REAL-TIME-TEST NOTE ── startOfficerDrift() used to run here,
+    // randomly jittering every on-duty officer's marker position every
+    // 3s via Math.random() — unconditional simulated movement. Real
+    // officer positions already arrive via StationData.mergeLiveOfficers
+    // (see bindLive's GeamsSync.watch('lcr:'+lcrId+':officers', ...)
+    // above), fed by each Dispatch device's actual GPS. The drift timer
+    // was overwriting those real positions with fake ones on top, every
+    // 3 seconds, for every officer, unconditionally. Removed rather than
+    // re-gated — there's no legitimate reason for it to run at all now
+    // that real positions exist.
 
     // Legend
     addLegend();
@@ -6285,6 +6325,8 @@ const StationComms = (() => {
   let chatTimer   = null;
   let liveMessages = {};   // incId -> array of real synced messages (civilian/officer)
   let chatWatchStop = null;
+  let evidenceWatchStop = null;
+  let liveEvidence = {}; // incId -> array of real uploaded files, pushed live from the backend
 
   function render() {
     const el = document.getElementById('page-comms');
@@ -6369,6 +6411,35 @@ const StationComms = (() => {
               <div class="vid-btn active" title="Camera" onclick="this.classList.toggle('muted');this.classList.toggle('active')">📹</div>
               <div class="vid-btn active" title="Record" onclick="StationApp.showToast('error','Not Available','Recording requires a real connected video feed — not yet wired in')">⏺</div>
               <div class="vid-btn end-call" title="End Call" onclick="StationApp.showToast('info','Nothing To End','No live video session is connected')">📵</div>
+            </div>
+          </div>
+
+          <!-- Evidence — real files uploaded from Dispatch/Civilian devices,
+               pushed here live via GeamsSync.watch('incident:{id}:evidence').
+               No local blob — this is what the officer's/civilian's device
+               actually transmitted to the backend. -->
+          <div class="panel" style="max-height:180px;display:flex;flex-direction:column">
+            <div class="panel-header"><span>📎</span><span class="panel-title">Evidence — ${activeIncId||'—'}</span></div>
+            <div style="overflow-y:auto;padding:8px 12px">
+              ${(() => {
+                const items = (activeIncId && liveEvidence[activeIncId]) || [];
+                if (!items.length) return `<div style="padding:12px 4px;color:var(--text-muted);font-size:0.72rem">No evidence received for this incident yet.</div>`;
+                return items.map(m => {
+                  const url = GeamsSync.mediaUrl(m.url);
+                  const thumb = m.contentType && m.contentType.startsWith('image/') && url
+                    ? `<img src="${url}" style="width:44px;height:44px;object-fit:cover;border-radius:6px">`
+                    : `<div style="width:44px;height:44px;border-radius:6px;background:var(--bg-hover);display:flex;align-items:center;justify-content:center;font-size:1.1rem">${m.contentType && m.contentType.startsWith('video/') ? '🎥' : m.contentType && m.contentType.startsWith('audio/') ? '🎙' : '📄'}</div>`;
+                  const sizeKB = m.size ? (m.size > 1024*1024 ? (m.size/1024/1024).toFixed(1)+'MB' : Math.round(m.size/1024)+'KB') : '';
+                  return `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border-dim)">
+                    ${thumb}
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:0.72rem;font-weight:600">${m.type || m.filename || 'Evidence'}</div>
+                      <div style="font-size:0.62rem;color:var(--text-muted)">${m.uploadedBy||'Unknown'} · ${sizeKB}${m.notes ? ' · ' + m.notes : ''}</div>
+                    </div>
+                    ${url ? `<a class="btn btn-ghost btn-sm" href="${url}" target="_blank" rel="noopener">👁 View</a>` : ''}
+                  </div>`;
+                }).join('');
+              })()}
             </div>
           </div>
 
@@ -6468,6 +6539,11 @@ const StationComms = (() => {
   function openChat(incId) {
     activeIncId = incId;
     if (chatWatchStop) { chatWatchStop(); chatWatchStop = null; }
+    if (evidenceWatchStop) { evidenceWatchStop(); evidenceWatchStop = null; }
+    evidenceWatchStop = GeamsSync.watch('incident:' + incId + ':evidence', [], (list) => {
+      liveEvidence[incId] = Array.isArray(list) ? list : [];
+      if (activeIncId === incId && document.getElementById('page-comms')?.classList.contains('active')) render();
+    });
     const inc = StationData.incidents.find(i => i.id === incId);
     if (inc && inc.source === 'civilian-app' && typeof GeamsStationSync !== 'undefined') {
       if (!liveMessages[incId]) liveMessages[incId] = [];
