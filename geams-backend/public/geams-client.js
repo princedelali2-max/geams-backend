@@ -166,6 +166,42 @@ const GeamsSync = (() => {
     };
   }
 
+  /* ── MEDIA UPLOAD ─────────────────────────────────────────────────────
+     POSTs a real File/Blob (photo, video, audio, PDF) to the backend's
+     /api/media/upload. The server stores it and appends a reference to the
+     shared key `incident:{incidentId}:evidence`, which every LCR/HQ/Dispatch
+     device watching that incident receives live. Returns {ok:true, path,
+     mediaId, size, contentType} or {ok:false, reason} — never pretends. */
+  function httpBase() {
+    if (!GEAMS_BACKEND_URL) return null;
+    return GEAMS_BACKEND_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\?.*$/, '').replace(/\/ws\/?$/, '');
+  }
+  async function uploadMedia(file, meta) {
+    meta = meta || {};
+    const base = httpBase();
+    if (!base) return { ok:false, reason:'No backend configured' };
+    if (!file) return { ok:false, reason:'No file to upload' };
+    const contentType = String(file.type || meta.contentType || '').split(';')[0] || 'application/octet-stream';
+    const qs = new URLSearchParams({
+      token: GEAMS_AUTH_TOKEN, incidentId: meta.incidentId || '', type: meta.type || '',
+      filename: meta.filename || file.name || '', notes: meta.notes || '', uploadedBy: meta.uploadedBy || '', contentType,
+    });
+    try {
+      const res = await fetch(base + '/api/media/upload?' + qs.toString(), { method: 'POST', headers: { 'Content-Type': contentType }, body: file });
+      let data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (res.ok && data.ok) return { ok:true, mediaId: data.mediaId, path: data.url, size: data.size, contentType: data.contentType };
+      return { ok:false, reason: data.error || ('Upload failed (HTTP ' + res.status + ')') };
+    } catch (e) { return { ok:false, reason:'Network error — the upload did not complete' }; }
+  }
+  // Full authorised URL for a stored file (e.g. an <img src> or <video src>),
+  // given the relative path the server returned (/api/media/{id}).
+  function mediaUrl(path) {
+    const base = httpBase();
+    if (!base || !path) return null;
+    return base + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
+  }
+
   /* ── CALL SIGNALING (WebRTC) ──────────────────────────────────────────
      A thin relay, not stored state: registerUserId ties this socket to
      a real identity (civilian id / officer badge / station id) so the
@@ -184,6 +220,6 @@ const GeamsSync = (() => {
   return {
     available, getShared, setShared, mergeShared, watch,
     ready: readyPromise, get mode() { return mode; }, get clientId() { return CLIENT_ID; },
-    registerUserId, onSignal, sendSignal,
+    registerUserId, onSignal, sendSignal, uploadMedia, mediaUrl,
   };
 })();
