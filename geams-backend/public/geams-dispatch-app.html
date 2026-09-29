@@ -1049,6 +1049,42 @@ const GeamsSync = (() => {
     };
   }
 
+  /* ── MEDIA UPLOAD ─────────────────────────────────────────────────────
+     POSTs a real File/Blob (photo, video, audio, PDF) to the backend's
+     /api/media/upload. The server stores it and appends a reference to the
+     shared key `incident:{incidentId}:evidence`, which every LCR/HQ/Dispatch
+     device watching that incident receives live. Returns {ok:true, path,
+     mediaId, size, contentType} or {ok:false, reason} — never pretends. */
+  function httpBase() {
+    if (!GEAMS_BACKEND_URL) return null;
+    return GEAMS_BACKEND_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\?.*$/, '').replace(/\/ws\/?$/, '');
+  }
+  async function uploadMedia(file, meta) {
+    meta = meta || {};
+    const base = httpBase();
+    if (!base) return { ok:false, reason:'No backend configured' };
+    if (!file) return { ok:false, reason:'No file to upload' };
+    const contentType = String(file.type || meta.contentType || '').split(';')[0] || 'application/octet-stream';
+    const qs = new URLSearchParams({
+      token: GEAMS_AUTH_TOKEN, incidentId: meta.incidentId || '', type: meta.type || '',
+      filename: meta.filename || file.name || '', notes: meta.notes || '', uploadedBy: meta.uploadedBy || '', contentType,
+    });
+    try {
+      const res = await fetch(base + '/api/media/upload?' + qs.toString(), { method: 'POST', headers: { 'Content-Type': contentType }, body: file });
+      let data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (res.ok && data.ok) return { ok:true, mediaId: data.mediaId, path: data.url, size: data.size, contentType: data.contentType };
+      return { ok:false, reason: data.error || ('Upload failed (HTTP ' + res.status + ')') };
+    } catch (e) { return { ok:false, reason:'Network error — the upload did not complete' }; }
+  }
+  // Full authorised URL for a stored file (e.g. an <img src> or <video src>),
+  // given the relative path the server returned (/api/media/{id}).
+  function mediaUrl(path) {
+    const base = httpBase();
+    if (!base || !path) return null;
+    return base + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
+  }
+
   /* ── CALL SIGNALING (WebRTC) ──────────────────────────────────────────
      A thin relay, not stored state: registerUserId ties this socket to
      a real identity (civilian id / officer badge / station id) so the
@@ -1067,7 +1103,7 @@ const GeamsSync = (() => {
   return {
     available, getShared, setShared, mergeShared, watch,
     ready: readyPromise, get mode() { return mode; }, get clientId() { return CLIENT_ID; },
-    registerUserId, onSignal, sendSignal,
+    registerUserId, onSignal, sendSignal, uploadMedia, mediaUrl,
   };
 })();
 
@@ -1442,11 +1478,10 @@ const DispatchData=((  )=>{
   // geams-realtime-backend-spec.md §9 once the WebSocket backend replaces it).
   const chatHistory=[];
   const evidence=[];
-  const activityLog=[
-    {time:fmt(new Date(Date.now()-14*60000)),text:'<strong>INC-1001</strong> assigned — Kidnapping · Osu, Accra',     lcrId:'GH-GA-ACC-007'},
-    {time:fmt(new Date(Date.now()-12*60000)),text:'Job received — awaiting acceptance',                                 lcrId:'GH-GA-ACC-007'},
-    {time:fmt(new Date(Date.now()-11*60000)),text:'GPS lock confirmed — tracking active',                               lcrId:'GH-GA-ACC-007'},
-    {time:fmt(new Date(Date.now()-9*60000)), text:'Station comms established — encrypted channel open',                lcrId:'GH-GA-ACC-007'}];
+  // Starts empty — this used to be seeded with four fabricated entries
+  // ("INC-1001 assigned — Kidnapping · Osu, Accra" etc.) describing events
+  // that never happened. Entries are now added only by real actions.
+  const activityLog=[];
   // Returns only activity log entries that belong to the officer's assigned LCR.
   // Entries with no lcrId tag (legacy / system) are shown to everyone.
   // In production, this filtering would be server-side (the API only returns
@@ -2412,48 +2447,205 @@ const DispatchApp = (() => {
   }
 
   // ── EVIDENCE ──
-  function toggleBodyCam() {
-    bodyCamActive=!bodyCamActive;
-    DispatchData.currentJob.bodyCamActive=bodyCamActive;
+  // ── REAL-TIME-TEST NOTE ── This used to just flip a boolean and show
+  // fake toasts ("Body camera started — recording to secure storage")
+  // with zero getUserMedia() call anywhere — no camera was ever opened,
+  // which is exactly why it looked like it "wasn't opening": nothing
+  // ever tried to. Now genuinely opens the device camera+mic, shows a
+  // live preview so the officer can see it's actually on, and records
+  // real video via MediaRecorder.
+  let bodyCamStream = null;
+  let bodyCamRecorder = null;
+  let bodyCamChunks = [];
+
+  async function toggleBodyCam() {
+    if (!bodyCamActive) {
+      try {
+        bodyCamStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true });
+      } catch (e) {
+        showToast('error', 'Camera Blocked', 'Allow camera and microphone access to start the body camera');
+        return;
+      }
+      let preview = document.getElementById('bodycam-preview');
+      if (!preview) {
+        preview = document.createElement('video');
+        preview.id = 'bodycam-preview';
+        preview.autoplay = true; preview.muted = true; preview.playsInline = true;
+        preview.style.cssText = 'position:fixed;top:60px;right:12px;width:140px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4)';
+        document.body.appendChild(preview);
+      }
+      preview.srcObject = bodyCamStream;
+
+      bodyCamChunks = [];
+      bodyCamRecorder = new MediaRecorder(bodyCamStream);
+      bodyCamRecorder.ondataavailable = (e) => { if (e.data.size > 0) bodyCamChunks.push(e.data); };
+      bodyCamRecorder.start();
+
+      bodyCamActive = true;
+      DispatchData.currentJob.bodyCamActive = true;
+      DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
+        text:'<strong>Body camera started</strong> — recording live'});
+      showToast('info', 'Body Camera Recording', 'Camera and microphone active');
+    } else {
+      const finalizeAndTag = () => {
+        const mime = ((bodyCamRecorder && bodyCamRecorder.mimeType) || 'video/webm').split(';')[0];
+        const blob = new Blob(bodyCamChunks, { type: mime });
+        const sizeMB = (blob.size / (1024*1024)).toFixed(1) + 'MB';
+        DispatchData.currentJob.evidenceCount++;
+        const entry = {
+          id: 'EVD-' + DispatchData.currentJob.id + '-' + DispatchData.currentJob.evidenceCount,
+          type: 'Body camera recording', time: DispatchData.fmt(new Date()), size: sizeMB,
+          fileName: 'bodycam-' + DispatchData.currentJob.id + '-' + Date.now() + (mime.includes('mp4') ? '.mp4' : '.webm'),
+          notes: '', contentType: mime, blobUrl: URL.createObjectURL(blob), _file: blob,
+          incidentId: realIncidentId(), uploadStatus: 'pending',
+        };
+        DispatchData.evidence.push(entry);
+        DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
+          text:`<strong>Body camera stopped</strong> — ${sizeMB} recorded on ${DispatchData.currentJob.id}`});
+        showToast('info', 'Body Camera Stopped', `${sizeMB} recorded — sending to the control room…`);
+        if (currentScreen === 'evidence') ScreenEvidence.render();
+        transmitEvidence(entry);
+      };
+      if (bodyCamRecorder && bodyCamRecorder.state !== 'inactive') {
+        bodyCamRecorder.onstop = finalizeAndTag;
+        bodyCamRecorder.stop();
+      }
+      if (bodyCamStream) { bodyCamStream.getTracks().forEach(t => t.stop()); bodyCamStream = null; }
+      const preview = document.getElementById('bodycam-preview');
+      if (preview) preview.remove();
+      bodyCamActive = false;
+      DispatchData.currentJob.bodyCamActive = false;
+    }
     const btns=document.querySelectorAll('#bodycam-btn');
     btns.forEach(btn=>{
       btn.className=bodyCamActive?'btn btn-danger btn-full':'btn btn-cyan btn-full';
       btn.innerHTML=bodyCamActive?'⏹ Stop Body Camera':'⏺ Body Camera';
     });
-    DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
-      text:bodyCamActive?'<strong>Body camera started</strong> — recording to secure storage':'<strong>Body camera stopped</strong> — footage uploading'});
-    showToast(bodyCamActive?'info':'success',bodyCamActive?'Body Camera Recording':'Body Camera Stopped',
-      bodyCamActive?'Footage saved to secure evidence storage':'Footage uploaded — tagged to '+DispatchData.currentJob.id);
     if(currentScreen==='evidence')ScreenEvidence.render();
   }
 
+  // ── REAL-TIME-TEST NOTE ── The upload zone's onclick used to just show
+  // a toast claiming "Opening camera / file selector..." with no actual
+  // <input type="file"> or getUserMedia() anywhere — nothing ever opened.
+  // confirmUpload() then fabricated a fixed "2.4MB" / "Scene photograph"
+  // regardless of what (if anything) was picked. Now uses a real hidden
+  // file input with `capture="environment"`, which mobile browsers use
+  // to open the actual camera (or gallery, at the user's choice), and
+  // tags the evidence with the real file's name/size/type.
+  let pendingEvidenceFile = null;
   function uploadEvidence() {
+    pendingEvidenceFile = null;
     openSheet('📎 Upload Evidence',`
-      <div class="upload-zone" onclick="DispatchApp.showToast('info','Upload','Opening camera / file selector...')">
+      <input type="file" id="evidence-file-input" accept="image/*,video/*,application/pdf" capture="environment" style="display:none" onchange="DispatchApp.handleEvidenceFileSelected(this)">
+      <div class="upload-zone" id="evidence-upload-zone" onclick="document.getElementById('evidence-file-input').click()">
         <div class="upload-icon">📷</div>
-        <div class="upload-label">Tap to take photo or select file</div>
+        <div class="upload-label" id="evidence-upload-label">Tap to take photo/video or select a file</div>
         <div style="font-size:0.65rem;color:var(--text-ghost);margin-top:4px">JPG · PNG · MP4 · PDF</div>
       </div>
       <div class="form-group" style="margin-top:14px"><label class="form-label">Evidence Type</label>
-        <select class="form-select">
+        <select class="form-select" id="evidence-type-select">
           <option>Scene photograph</option><option>Suspect photo</option>
           <option>Video recording</option><option>Document / ID scan</option>
           <option>Injury documentation</option><option>Property / stolen item</option>
         </select></div>
       <div class="form-group"><label class="form-label">Notes</label>
-        <textarea class="form-textarea" rows="2" placeholder="Brief description..."></textarea></div>`,
+        <textarea class="form-textarea" id="evidence-notes" rows="2" placeholder="Brief description..."></textarea></div>`,
       `<button class="btn btn-ghost" onclick="DispatchApp.closeSheet()">Cancel</button>
        <button class="btn btn-primary btn-full" onclick="DispatchApp.confirmUpload()">📎 Upload &amp; Tag to Case</button>`);
   }
+  function handleEvidenceFileSelected(inputEl) {
+    const file = inputEl.files && inputEl.files[0];
+    if (!file) return;
+    pendingEvidenceFile = file;
+    const label = document.getElementById('evidence-upload-label');
+    const zone = document.getElementById('evidence-upload-zone');
+    if (label) label.textContent = `✓ ${file.name} (${(file.size/1024).toFixed(0)}KB) — tap to change`;
+    if (zone) zone.style.borderColor = 'var(--green)';
+    // Auto-select a sensible evidence type from the real file's MIME type
+    // rather than leaving whatever the dropdown happened to default to.
+    const typeSel = document.getElementById('evidence-type-select');
+    if (typeSel && file.type.startsWith('video/')) typeSel.value = 'Video recording';
+    else if (typeSel && file.type === 'application/pdf') typeSel.value = 'Document / ID scan';
+  }
   function confirmUpload() {
+    if (!pendingEvidenceFile) { showToast('error', 'No File Selected', 'Take a photo/video or choose a file first'); return; }
+    const file = pendingEvidenceFile;
+    const notes = document.getElementById('evidence-notes')?.value || '';
+    const type = document.getElementById('evidence-type-select')?.value || 'Scene photograph';
     closeSheet();
     DispatchData.currentJob.evidenceCount++;
-    DispatchData.evidence.push({id:'EVD-'+DispatchData.currentJob.id+'-'+DispatchData.currentJob.evidenceCount,
-      type:'Scene photograph',time:DispatchData.fmt(new Date()),size:'2.4MB'});
-    DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,text:`<strong>Evidence uploaded</strong> — ${DispatchData.currentJob.evidenceCount} files on case`});
-    showToast('success','Evidence Uploaded','File tagged to '+DispatchData.currentJob.id+' — tamper sealed');
+    const entry = {
+      id:'EVD-'+DispatchData.currentJob.id+'-'+DispatchData.currentJob.evidenceCount,
+      type, time:DispatchData.fmt(new Date()),
+      size: file.size > 1024*1024 ? (file.size/(1024*1024)).toFixed(1)+'MB' : (file.size/1024).toFixed(0)+'KB',
+      fileName: file.name, notes, contentType: file.type,
+      blobUrl: URL.createObjectURL(file), // instant local preview, independent of the upload
+      _file: file,                        // kept so a failed upload can be retried
+      incidentId: realIncidentId(),
+      uploadStatus: 'pending',
+    };
+    DispatchData.evidence.push(entry);
+    DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,text:`<strong>Evidence captured</strong> — ${file.name} (${entry.size}) on ${DispatchData.currentJob.id}`});
+    pendingEvidenceFile = null;
     if(currentScreen==='evidence')ScreenEvidence.render();
     if(currentScreen==='job')ScreenJob.render();
+    transmitEvidence(entry);
+  }
+
+  // The shared incident id this job is really linked to (the record LCR/HQ
+  // are looking at). Demo jobs that never came from a real civilian report
+  // have none — evidence for those honestly stays on the device.
+  function realIncidentId() {
+    const job = DispatchData.currentJob;
+    return job && job._syncSource === 'civilian-app' ? job._syncIncId : null;
+  }
+
+  // Actually sends the file to the backend. The server stores it and
+  // pushes a reference to every LCR/HQ device watching this incident.
+  async function transmitEvidence(entry) {
+    const refresh = () => { if(currentScreen==='evidence')ScreenEvidence.render(); };
+    if (!entry.incidentId) {
+      entry.uploadStatus = 'local';
+      refresh();
+      showToast('warning','Saved On This Device Only','This is a demo job with no real incident behind it, so there is nowhere to send the file', 6000);
+      return;
+    }
+    if (!GeamsSync.available()) {
+      entry.uploadStatus = 'failed'; entry.uploadReason = 'No real-time connection';
+      refresh();
+      showToast('error','Not Delivered','No connection to the control room — the file is saved here and can be retried from the Evidence screen', 7000);
+      return;
+    }
+    entry.uploadStatus = 'uploading'; refresh();
+    const r = await GeamsSync.uploadMedia(entry._file, {
+      incidentId: entry.incidentId, type: entry.type, filename: entry.fileName,
+      notes: entry.notes, uploadedBy: DispatchData.officer.id,
+    });
+    if (r.ok) {
+      entry.uploadStatus = 'sent'; entry.uploadReason = ''; entry.mediaPath = r.path;
+      DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
+        text:`<strong>Evidence delivered to LCR</strong> — ${entry.fileName || entry.id} (${entry.size})`});
+      showToast('success','Delivered To Control Room', (entry.fileName || entry.id) + ' is now visible to the LCR');
+    } else {
+      entry.uploadStatus = 'failed'; entry.uploadReason = r.reason;
+      showToast('error','Not Delivered', r.reason + ' — you can retry from the Evidence screen', 7000);
+    }
+    refresh();
+  }
+  function retryEvidenceUpload(id) {
+    const e = DispatchData.evidence.find(x => x.id === id);
+    if (e && e._file) transmitEvidence(e);
+  }
+  function viewEvidence(id) {
+    const e = DispatchData.evidence.find(x => x.id === id);
+    if (!e || !e.blobUrl) { showToast('error','Not Available','This file is no longer available on this device'); return; }
+    const ct = e.contentType || '';
+    const media = ct.startsWith('video/') ? `<video src="${e.blobUrl}" controls playsinline style="width:100%;border-radius:8px"></video>`
+      : ct.startsWith('audio/') ? `<audio src="${e.blobUrl}" controls style="width:100%"></audio>`
+      : ct.startsWith('image/') ? `<img src="${e.blobUrl}" style="width:100%;border-radius:8px">`
+      : `<a class="btn btn-primary btn-full" href="${e.blobUrl}" target="_blank" rel="noopener">Open file</a>`;
+    openSheet('👁 ' + e.id, media + `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:10px">${e.type} · ${e.size}${e.notes ? ' · ' + e.notes : ''}</div>`,
+      `<button class="btn btn-ghost btn-full" onclick="DispatchApp.closeSheet()">Close</button>`);
   }
 
   function callCivilian() {
@@ -3384,7 +3576,7 @@ const DispatchApp = (() => {
     officerSOS,activateSOS,requestBackup,confirmBackup,requestForensics,confirmForensics,
     declareUnsafe,confirmUnsafe,runBiometricScan,runScan,runPlateCheck,runPlate,
     checkPriorCalls,interceptVehicle,confirmVictimStatus,setVictimStatus,
-    toggleBodyCam,uploadEvidence,confirmUpload,captureWitnessStatement,toggleAudioRec,saveWitness,
+    toggleBodyCam,uploadEvidence,confirmUpload,handleEvidenceFileSelected,viewEvidence,retryEvidenceUpload,captureWitnessStatement,toggleAudioRec,saveWitness,
     callCivilian,callStation,
     makeArrestRecord,confirmArrest,sketchScene,saveSketch,closeSketch,toggleSketchFullscreen,reportEquipment,
     transferCase,confirmTransfer,endShift,confirmEndShift,
@@ -3987,6 +4179,16 @@ const ScreenComms = (() => {
 
 /* ── EVIDENCE SCREEN ── */
 const ScreenEvidence = (() => {
+  // Real delivery state for each file — what actually happened when the
+  // upload was attempted, not an assumed success.
+  function statusLine(e){
+    const line = (color, html) => `<div style="font-size:0.65rem;color:${color};margin-top:2px">${html}</div>`;
+    if (e.uploadStatus === 'sent') return line('var(--green)', '✓ Delivered to LCR');
+    if (e.uploadStatus === 'uploading' || e.uploadStatus === 'pending') return line('var(--cyan)', '⏳ Sending to LCR…');
+    if (e.uploadStatus === 'local') return line('var(--text-muted)', 'Saved on this device only (demo job — no real incident)');
+    if (e.uploadStatus === 'failed') return line('var(--red)', `✗ Not delivered — ${e.uploadReason || 'failed'} <a href="#" style="color:var(--primary)" onclick="DispatchApp.retryEvidenceUpload('${e.id}');return false">Retry</a>`);
+    return '';
+  }
   function render(){
     const el=document.getElementById('screen-evidence');
     if(!el)return;
@@ -4023,9 +4225,9 @@ const ScreenEvidence = (() => {
                 <div class="info-body">
                   <div class="info-key">${e.id}</div>
                   <div class="info-val">${e.type}</div>
-                  <div style="font-size:0.65rem;color:var(--text-muted)">${e.time} · ${e.size} · Tamper-sealed</div>
+                  <div style="font-size:0.65rem;color:var(--text-muted)">${e.time} · ${e.size}</div>${statusLine(e)}
                 </div>
-                <button class="btn btn-sm btn-ghost" onclick="DispatchApp.showToast('info','View','Opening evidence viewer...')">👁</button>
+                <button class="btn btn-sm btn-ghost" onclick="DispatchApp.viewEvidence('${e.id}')">👁</button>
               </div>`).join('')
             :`<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:0.78rem">
                 No evidence uploaded yet.<br>
