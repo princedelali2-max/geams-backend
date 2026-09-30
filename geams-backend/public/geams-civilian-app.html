@@ -439,8 +439,22 @@ option{background:var(--bg-deep);}
   animation:fadeIn 0.3s 1.5s var(--ease) both;}
 
 /* ── PIN LOGIN GATE ── */
+/* ── REAL BUG FOUND ── #pin-gate is fixed+centered with no overflow
+   handling at all. On a shorter/mobile viewport, content taller than the
+   screen (the 6-field signup form, especially with a field focused and
+   the OS keyboard shrinking the visible area further) gets clipped
+   equally off the top AND bottom with zero way to scroll to either end
+   — exactly what looked like "numbers on top, nothing reachable at the
+   bottom." overflow-y:auto lets it scroll; the doubled justify-content
+   line is progressive enhancement — `safe center` keeps real centering
+   when content fits, but degrades to top-aligned (reachable via scroll)
+   instead of symmetric-clipped when it doesn't. Browsers that don't
+   understand `safe center` simply ignore that line and keep plain
+   `center`, which still works correctly now that overflow-y:auto exists. */
 #pin-gate{position:fixed;inset:0;z-index:9998;background:var(--bg-void);
   display:flex;flex-direction:column;align-items:center;justify-content:center;
+  justify-content:safe center;
+  overflow-y:auto;-webkit-overflow-scrolling:touch;
   gap:16px;padding:20px;text-align:center;transition:opacity 0.35s var(--ease);}
 #pin-gate.hidden{display:none;}
 #pin-gate.fading{opacity:0;pointer-events:none;}
