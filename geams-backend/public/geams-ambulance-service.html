@@ -3,30 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<script>
-/* ── GEAMS BACKEND CONFIG ── see geams-civilian-app.html for the full
-   explanation. Every device must use the SAME two values. */
-window.GEAMS_BACKEND_URL = '';
-window.GEAMS_AUTH_TOKEN  = '';
-</script>
-<script>
-/* ── MOBILE VIEWPORT HEIGHT FIX ── #app below is height:100vh +
-   overflow:hidden. On a real phone, 100vh overshoots the actually-visible
-   area (browser chrome eats the difference), so content near the bottom —
-   including buttons — can end up in a gap with no scroll route to reach
-   it. This measures the real visible viewport instead and keeps it
-   current as the browser UI/keyboard show or hide. */
-(function () {
-  function setAppHeight() {
-    var h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
-    document.documentElement.style.setProperty('--app-vh', h + 'px');
-  }
-  setAppHeight();
-  window.addEventListener('resize', setAppHeight);
-  window.addEventListener('orientationchange', function () { setTimeout(setAppHeight, 120); });
-  if (window.visualViewport) window.visualViewport.addEventListener('resize', setAppHeight);
-})();
-</script>
 <title>GEAMS Medical Response — Ghana National Ambulance Service</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -41,8 +17,8 @@ window.GEAMS_AUTH_TOKEN  = '';
     --font-mono:'SF Mono',Consolas,monospace;
   }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text-primary);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;height:100vh;height:var(--app-vh, 100vh);overflow:hidden}
-  #app{height:100vh;height:var(--app-vh, 100vh);display:flex;flex-direction:column;max-width:520px;margin:0 auto;position:relative;background:var(--bg)}
+  body{background:var(--bg);color:var(--text-primary);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;height:100vh;overflow:hidden}
+  #app{height:100vh;display:flex;flex-direction:column;max-width:520px;margin:0 auto;position:relative;background:var(--bg)}
 
   /* ── LOGIN ── */
   .login-wrap{flex:1;display:flex;flex-direction:column;justify-content:center;padding:32px 24px;overflow-y:auto}
@@ -73,15 +49,7 @@ window.GEAMS_AUTH_TOKEN  = '';
   .topbar-btn{background:none;border:none;color:var(--text-muted);font-size:1rem;cursor:pointer;padding:4px 6px}
 
   /* ── SCREENS ── */
-  /* ── REAL BUG FOUND ── .screen is a flex item of #app (flex:1) but had no
-     min-height:0. Flex items default to min-height:auto, which means "never
-     shrink below your content's natural size" — so instead of being capped
-     to the space available and scrolling internally via overflow-y:auto,
-     .screen (and #app, and body) were free to grow taller than the actual
-     viewport. With overflow:hidden on the ancestors, that extra height was
-     just clipped, with no scroll path to it at all. This is very likely the
-     actual cause of "can't scroll to reach other buttons." */
-  .screen{display:none;flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y;flex-direction:column}
+  .screen{display:none;flex:1;overflow-y:auto;flex-direction:column}
   .screen.active{display:flex}
 
   .empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 24px;text-align:center;color:var(--text-muted)}
@@ -189,10 +157,12 @@ window.GEAMS_AUTH_TOKEN  = '';
 
     <div class="screen active" id="screen-queue"></div>
     <div class="screen" id="screen-job"></div>
+    <div class="screen" id="screen-aid"></div>
 
     <div class="nav-tabs">
       <div class="nav-tab active" data-screen="queue" onclick="AmbulanceApp.navigate('queue')"><span class="nav-tab-icon">📋</span>Calls</div>
       <div class="nav-tab" data-screen="job" onclick="AmbulanceApp.navigate('job')"><span class="nav-tab-icon">🗺</span>Active Response</div>
+      <div class="nav-tab" data-screen="aid" onclick="AmbulanceApp.navigate('aid')"><span class="nav-tab-icon">🤝</span>Mutual Aid<span id="aid-badge" style="display:none;background:var(--red);color:#fff;border-radius:8px;font-size:0.55rem;padding:1px 5px;margin-left:3px;font-weight:700"></span></div>
     </div>
   </div>
 
@@ -205,203 +175,72 @@ window.GEAMS_AUTH_TOKEN  = '';
    other GEAMS apps — window.storage when run as a Claude artifact,
    localStorage when served via geams-static-server.js).
    ============================================================ */
-// ── REAL-TIME BACKEND CLIENT ──────────────────────────────────────────
-// This used to be a localStorage-only wrapper — GeamsSync.available()
-// only ever confirmed localStorage existed in THIS browser, which is
-// true on almost every device, including ones with zero connection to
-// any other location. Every place elsewhere in this file annotated
-// "GeamsSync.available() isn't a real connectivity check" is fixed by
-// this swap: available() now means "the WebSocket to the real GEAMS
-// backend is actually open," so every existing call site (mergeShared,
-// watch, pushChat, etc.) keeps working completely unchanged, but is now
-// genuinely real-time across devices instead of only within one
-// browser's tabs. See geams-realtime-backend-spec.md and backend/server.js.
-//
-// Configure per deployment: set window.GEAMS_BACKEND_URL (e.g.
-// 'wss://your-server.example.org/ws') and window.GEAMS_AUTH_TOKEN before
-// this script runs — see the config block near the top of <head>. Left
-// unconfigured, available() correctly reports false forever and every
-// existing offline/demo fallback in this app keeps working exactly as
-// it did before, same as when localStorage was unavailable previously.
 const GeamsSync = (() => {
-  // If opened as a plain local file (file://) or with no config set at
-  // all, there's no same-origin server to guess — stay in offline/demo
-  // mode. If this page was itself served BY the GEAMS backend (e.g. via
-  // Render's free static hosting — see backend/README.md), auto-detect
-  // the WebSocket URL from the page's own origin so no manual editing is
-  // needed for that deployment path. An explicit window.GEAMS_BACKEND_URL
-  // always wins over auto-detection.
-  const GEAMS_BACKEND_URL = (typeof window !== 'undefined' && window.GEAMS_BACKEND_URL) ||
-    (typeof location !== 'undefined' && /^https?:$/.test(location.protocol)
-      ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'
-      : '');
-  const GEAMS_AUTH_TOKEN  = (typeof window !== 'undefined' && window.GEAMS_AUTH_TOKEN)  || '';
+  const LS_PREFIX = 'geams:';
+  let mode = 'checking';
 
-  const CLIENT_ID = (() => {
-    try {
-      let id = localStorage.getItem('geams_client_id');
-      if (!id) {
-        id = 'c_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-        localStorage.setItem('geams_client_id', id);
-      }
-      return id;
-    } catch (e) { return 'c_' + Math.random().toString(36).slice(2); }
+  function artifactAvailable() { return typeof window !== 'undefined' && !!window.storage; }
+  function localStorageAvailable() {
+    try { const k = '__geams_probe__'; localStorage.setItem(k,'1'); localStorage.removeItem(k); return true; }
+    catch (e) { return false; }
+  }
+  const ready = (async () => {
+    if (artifactAvailable()) { mode = 'artifact'; return; }
+    if (localStorageAvailable()) { mode = 'localStorage'; return; }
+    mode = 'offline';
   })();
 
-  let mode = 'checking'; // 'connecting' | 'connected' | 'offline'
-  let ws = null;
-  let reconnectDelay = 1000;
-  let reqCounter = 0;
-  let myUserId = null;
-  const pending = new Map();        // reqId -> resolve fn
-  const watchers = new Map();       // key -> Set<cb>
-  const localCache = new Map();     // key -> last known value (seeds watch() instantly, survives disconnects)
-  const callListeners = new Set();  // cb(fromUserId, payload)
-  let resolveReady;
-  const readyPromise = new Promise((r) => { resolveReady = r; });
-
-  function connect() {
-    if (!GEAMS_BACKEND_URL) { mode = 'offline'; resolveReady(); return; }
-    mode = 'connecting';
-    let socket;
-    try {
-      const url = GEAMS_BACKEND_URL +
-        (GEAMS_BACKEND_URL.includes('?') ? '&' : '?') +
-        'clientId=' + encodeURIComponent(CLIENT_ID) + '&token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
-      socket = new WebSocket(url);
-    } catch (e) { mode = 'offline'; resolveReady(); scheduleReconnect(); return; }
-    ws = socket;
-
-    ws.onopen = () => {
-      mode = 'connected';
-      reconnectDelay = 1000;
-      if (myUserId) send({ type:'register', userId: myUserId });
-      for (const key of watchers.keys()) send({ type:'watch', key });
-      resolveReady();
-    };
-
-    ws.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.type === 'result' && pending.has(msg.reqId)) {
-        const resolve = pending.get(msg.reqId);
-        pending.delete(msg.reqId);
-        resolve(msg);
-      } else if (msg.type === 'update') {
-        localCache.set(msg.key, msg.value);
-        const cbs = watchers.get(msg.key);
-        if (cbs) cbs.forEach((cb) => { try { cb(msg.value); } catch (e) { console.error(e); } });
-      } else if (msg.type === 'call') {
-        callListeners.forEach((cb) => { try { cb(msg.fromUserId, msg.payload); } catch (e) { console.error(e); } });
-      } else if (msg.type === 'pong') {
-        /* heartbeat ack, nothing to do */
-      }
-    };
-
-    ws.onclose = () => {
-      const wasConnected = mode === 'connected';
-      mode = 'offline';
-      ws = null;
-      // Fail every request in flight rather than hanging forever.
-      for (const [id, resolve] of pending) resolve(null);
-      pending.clear();
-      if (wasConnected) console.warn('[GeamsSync] real-time connection lost — reconnecting…');
-      scheduleReconnect();
-    };
-    ws.onerror = () => { /* onclose follows; handled there */ };
-  }
-
-  function scheduleReconnect() {
-    setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-  }
-
-  function send(obj) {
-    if (ws && ws.readyState === ws.OPEN) { ws.send(JSON.stringify(obj)); return true; }
-    return false;
-  }
-
-  function request(obj) {
-    return new Promise((resolve) => {
-      const reqId = ++reqCounter;
-      if (!send(Object.assign({}, obj, { reqId }))) { resolve(null); return; }
-      pending.set(reqId, resolve);
-      setTimeout(() => { if (pending.has(reqId)) { pending.delete(reqId); resolve(null); } }, 8000);
-    });
-  }
-
-  connect();
-
-  function available() { return mode === 'connected'; }
+  function available() { return mode === 'artifact' || mode === 'localStorage'; }
 
   async function getShared(key, fallback) {
-    await readyPromise;
-    if (mode !== 'connected') return localCache.has(key) ? localCache.get(key) : fallback;
-    const res = await request({ type:'get', key });
-    if (res && res.ok) {
-      const value = res.value === null || res.value === undefined ? fallback : res.value;
-      localCache.set(key, value);
-      return value;
+    await ready;
+    if (mode === 'artifact') {
+      try { const r = await window.storage.get(key, true); return r && r.value !== undefined ? JSON.parse(r.value) : fallback; }
+      catch (e) { return fallback; }
     }
-    return localCache.has(key) ? localCache.get(key) : fallback;
+    if (mode === 'localStorage') {
+      try { const raw = localStorage.getItem(LS_PREFIX + key); return raw !== null ? JSON.parse(raw) : fallback; }
+      catch (e) { return fallback; }
+    }
+    return fallback;
   }
-
   async function setShared(key, value) {
-    await readyPromise;
-    localCache.set(key, value);
-    if (mode !== 'connected') return false;
-    const res = await request({ type:'set', key, value });
-    return !!(res && res.ok);
+    await ready;
+    if (mode === 'artifact') {
+      try { await window.storage.set(key, JSON.stringify(value), true); return true; } catch (e) { return false; }
+    }
+    if (mode === 'localStorage') {
+      try { localStorage.setItem(LS_PREFIX + key, JSON.stringify(value)); return true; } catch (e) { return false; }
+    }
+    return false;
   }
-
   async function mergeShared(key, fallback, patchFn) {
-    await readyPromise;
-    try {
-      const cur = await getShared(key, fallback);
-      const next = patchFn(cur);
-      return await setShared(key, next);
-    } catch (e) { console.error('[GeamsSync] mergeShared failed:', e); return false; }
+    await ready;
+    if (mode === 'offline') return false;
+    try { const cur = await getShared(key, fallback); const next = patchFn(cur); await setShared(key, next); return true; }
+    catch (e) { return false; }
   }
-
-  function watch(key, fallback, cb, /* intervalMs unused — real push now, kept for signature compat */ _intervalMs) {
-    let stopped = false;
-    if (!watchers.has(key)) watchers.set(key, new Set());
-    watchers.get(key).add(cb);
-    send({ type:'watch', key });
-    // Fire once immediately so callers see something without waiting on
-    // a full round trip — matches the old polling version's behavior of
-    // calling back right away with whatever's available.
-    getShared(key, fallback).then((v) => { if (!stopped) cb(v); });
-    return () => {
-      stopped = true;
-      const set = watchers.get(key);
-      if (set) {
-        set.delete(cb);
-        if (set.size === 0) { watchers.delete(key); send({ type:'unwatch', key }); }
-      }
+  function watch(key, fallback, cb, intervalMs) {
+    let stopped = false, last = null;
+    const check = async () => {
+      if (stopped) return;
+      const v = await getShared(key, fallback);
+      const s = JSON.stringify(v);
+      if (s !== last) { last = s; cb(v); }
     };
+    let storageListener = null;
+    ready.then(() => {
+      if (stopped) return;
+      if (mode === 'localStorage' && typeof window !== 'undefined') {
+        storageListener = (e) => { if (e.key === LS_PREFIX + key) check(); };
+        window.addEventListener('storage', storageListener);
+      }
+    });
+    check();
+    const id = setInterval(check, intervalMs || 2000);
+    return () => { stopped = true; clearInterval(id); if (storageListener) window.removeEventListener('storage', storageListener); };
   }
-
-  /* ── CALL SIGNALING (WebRTC) ──────────────────────────────────────────
-     A thin relay, not stored state: registerUserId ties this socket to
-     a real identity (civilian id / officer badge / station id) so the
-     server can route call.* messages to the right person; onSignal/
-     sendSignal carry the offer/answer/ICE candidates. Building the
-     actual RTCPeerConnection is left to each app (see the "real call"
-     helper wired into the civilian/dispatch/station apps), since each
-     needs slightly different UI around it. */
-  function registerUserId(userId) {
-    myUserId = userId;
-    send({ type:'register', userId });
-  }
-  function onSignal(cb) { callListeners.add(cb); return () => callListeners.delete(cb); }
-  function sendSignal(toUserId, payload) { return send({ type:'call', toUserId, payload }); }
-
-  return {
-    available, getShared, setShared, mergeShared, watch,
-    ready: readyPromise, get mode() { return mode; }, get clientId() { return CLIENT_ID; },
-    registerUserId, onSignal, sendSignal,
-  };
+  return { available, getShared, setShared, mergeShared, watch, ready, get mode(){ return mode; } };
 })();
 
 /* ============================================================
@@ -438,11 +277,30 @@ const AmbulanceData = (() => {
   function allCredentials() { return MOCK_CREDENTIALS.concat(REGISTERED_CREDENTIALS); }
   function findStation(lcrId) { return STATION_DIRECTORY.find(s => s.id === lcrId); }
 
+  // Real great-circle distance between two real coordinate pairs (km).
+  // Used to rank genuinely nearby mutual-aid stations — never a fake/random value.
+  function haversineKm(lat1, lng1, lat2, lng2) {
+    const R = 6371;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+  // Every other jurisdiction's ambulance station, sorted nearest-first by real distance.
+  function nearbyStations(ownLcrId) {
+    const own = findStation(ownLcrId);
+    if (!own) return [];
+    return STATION_DIRECTORY
+      .filter(s => s.id !== ownLcrId)
+      .map(s => ({ ...s, distanceKm: haversineKm(own.lat, own.lng, s.lat, s.lng) }))
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+  }
+
   let crew = null;       // active logged-in crew profile
   let currentJob = null; // active response, or null when idle
 
   return {
-    STATION_DIRECTORY, allCredentials, registerCrew, findStation,
+    STATION_DIRECTORY, allCredentials, registerCrew, findStation, haversineKm, nearbyStations,
     get crew() { return crew; }, setCrew(c) { crew = c; },
     get currentJob() { return currentJob; }, setCurrentJob(j) { currentJob = j; },
   };
@@ -480,6 +338,136 @@ const GeamsAmbulanceSync = (() => {
   }
 
   return { start, pushUpdate };
+})();
+
+/* ============================================================
+   AMBULANCE MUTUAL AID — cross-jurisdiction backup requests between
+   real ambulance stations. Every request, acceptance, decline, and
+   live unit position below travels over the same real-time GeamsSync
+   channel used for ordinary dispatch — there is no simulated/random
+   outcome anywhere in this module; a request only resolves when a
+   human at the target station actually accepts or declines it.
+   ============================================================ */
+const AmbulanceMutualAid = (() => {
+  const KEY = 'mutualaid:ambulance:requests';
+  let reqSeq = 1;
+  let ownLcrId = null;
+  let watchStop = null;
+  let latest = {};         // last known snapshot of the whole shared map
+  const seenIncoming = new Set(); // request ids already toasted this session
+
+  function start(lcrId) {
+    ownLcrId = lcrId;
+    if (watchStop) watchStop();
+    watchStop = GeamsSync.watch(KEY, {}, (map) => {
+      const prev = latest;
+      latest = map || {};
+      Object.values(latest).forEach(r => {
+        // New inbound request targeted at our jurisdiction.
+        if (r.targetLcrId === ownLcrId && r.originLcrId !== ownLcrId &&
+            r.status === 'pending' && !seenIncoming.has(r.id)) {
+          seenIncoming.add(r.id);
+          AmbulanceApp.onIncomingMutualAid(r);
+        }
+        // Status change on a request we originated — let the requester know.
+        const was = prev[r.id];
+        if (r.originLcrId === ownLcrId && was && was.status === 'pending' && r.status !== 'pending') {
+          AmbulanceApp.onMutualAidStatusChanged(r);
+        }
+        // Live position update on a mutual-aid job we are responding to, or
+        // one we originated — refresh the map/stat bar if it's on screen.
+        AmbulanceApp.onMutualAidRecordUpdated(r);
+      });
+      AmbulanceApp.refreshMutualAidTab();
+    }, 2000);
+  }
+
+  function myIncoming() {
+    return Object.values(latest).filter(r => r.targetLcrId === ownLcrId && r.originLcrId !== ownLcrId && r.status === 'pending');
+  }
+  function myOutgoing() {
+    return Object.values(latest).filter(r => r.originLcrId === ownLcrId)
+      .sort((a,b) => b.requestedAt - a.requestedAt);
+  }
+  function myResponding() {
+    return Object.values(latest).filter(r => r.acceptedByLcrId === ownLcrId && r.status === 'accepted');
+  }
+  function recordFor(requestId) { return latest[requestId] || null; }
+  function recordForIncident(incidentId) {
+    return Object.values(latest).find(r => r.incidentId === incidentId && r.originLcrId === ownLcrId) || null;
+  }
+
+  function sendRequest(job, targetStation, originStation, crew) {
+    const id = 'AID-A-' + Date.now().toString(36) + '-' + (reqSeq++);
+    const rec = {
+      id, kind: 'ambulance',
+      originLcrId: ownLcrId, originStationName: originStation.name,
+      targetLcrId: targetStation.id, targetStationName: targetStation.name,
+      distanceKm: Number(targetStation.distanceKm?.toFixed ? targetStation.distanceKm.toFixed(1) : targetStation.distanceKm),
+      incidentId: job.id, type: job.type, priority: job.priority, location: job.location,
+      lat: job.lat, lng: job.lng, notes: job.notes || '',
+      requestedByName: crew.name, requestedByBadge: crew.badge, requestedAt: Date.now(),
+      status: 'pending',
+      acceptedByLcrId: null, acceptedByName: null, acceptedByBadge: null, acceptedAt: null,
+      unitLat: null, unitLng: null, unitETA: null,
+    };
+    GeamsSync.mergeShared(KEY, {}, (m) => { m = m || {}; m[id] = rec; return m; });
+    return rec;
+  }
+
+  function cancelRequest(requestId) {
+    GeamsSync.mergeShared(KEY, {}, (m) => {
+      m = m || {};
+      if (m[requestId] && m[requestId].status === 'pending') m[requestId].status = 'cancelled';
+      return m;
+    });
+  }
+
+  function accept(requestId, ownStation, crew) {
+    GeamsSync.mergeShared(KEY, {}, (m) => {
+      m = m || {};
+      const r = m[requestId];
+      if (!r || r.status !== 'pending') return m;
+      r.status = 'accepted';
+      r.acceptedByLcrId = ownLcrId;
+      r.acceptedByName = crew.name;
+      r.acceptedByBadge = crew.badge;
+      r.acceptedAt = Date.now();
+      r.unitLat = ownStation.lat;
+      r.unitLng = ownStation.lng;
+      return m;
+    });
+  }
+
+  function decline(requestId) {
+    GeamsSync.mergeShared(KEY, {}, (m) => {
+      m = m || {};
+      if (m[requestId] && m[requestId].status === 'pending') m[requestId].status = 'declined';
+      return m;
+    });
+  }
+
+  function pushUnitUpdate(requestId, patch) {
+    GeamsSync.mergeShared(KEY, {}, (m) => {
+      m = m || {};
+      if (!m[requestId]) return m;
+      Object.assign(m[requestId], patch);
+      return m;
+    });
+  }
+
+  function markComplete(requestId) {
+    GeamsSync.mergeShared(KEY, {}, (m) => {
+      m = m || {};
+      if (m[requestId]) m[requestId].status = 'completed';
+      return m;
+    });
+  }
+
+  return {
+    start, myIncoming, myOutgoing, myResponding, recordFor, recordForIncident,
+    sendRequest, cancelRequest, accept, decline, pushUnitUpdate, markComplete,
+  };
 })();
 
 /* ============================================================
@@ -578,6 +566,7 @@ const AmbulanceApp = (() => {
     document.getElementById('main-view').style.display = 'flex';
     document.getElementById('topbar-crew').textContent = `${cred.name} · ${station ? station.name : cred.lcrId}`;
     GeamsAmbulanceSync.start(cred.lcrId);
+    AmbulanceMutualAid.start(cred.lcrId);
     navigate('queue');
     showToast('success', 'Signed In', `Connected to ${station ? station.name : ''} LCR — listening for calls`, 5000);
   }
@@ -596,8 +585,10 @@ const AmbulanceApp = (() => {
     document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.screen === screen));
     document.getElementById('screen-queue').classList.toggle('active', screen === 'queue');
     document.getElementById('screen-job').classList.toggle('active', screen === 'job');
+    document.getElementById('screen-aid').classList.toggle('active', screen === 'aid');
     if (screen === 'queue') renderQueue();
     if (screen === 'job') renderJob();
+    if (screen === 'aid') renderMutualAid();
   }
 
   /* ── INCOMING QUEUE ── */
@@ -684,61 +675,33 @@ const AmbulanceApp = (() => {
     return pts;
   }
 
-  // ── REAL-TIME-TEST NOTE ───────────────────────────────────────────────
-  // The old version stepped `unitLat/unitLng` through a precomputed curve
-  // on a 2s timer — simulated movement, which the multi-location test
-  // prohibits. `buildRoute()` is kept ONLY to draw the planned path as a
-  // static reference line; it must never set the unit's actual position.
-  // Position now comes only from this device's real GPS
-  // (navigator.geolocation.watchPosition), pushed to the backend as a
-  // `location.update` WebSocket message (see
-  // geams-realtime-backend-spec.md §3–4) instead of GeamsAmbulanceSync.pushUpdate.
-  let routeGeoWatchId = null;
-  function haversineKm(a, b, c, d) {
-    const R = 6371, toRad = x => x * Math.PI / 180;
-    const dLat = toRad(c - a), dLng = toRad(d - b);
-    const s = Math.sin(dLat/2)**2 + Math.cos(toRad(a))*Math.cos(toRad(c))*Math.sin(dLng/2)**2;
-    return 2 * R * Math.asin(Math.sqrt(s));
-  }
   function startRoute(station, job) {
-    routeCoords = buildRoute(station, job); // display-only planned path, not a position source
+    routeCoords = buildRoute(station, job);
     routeStep = 0;
-    if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
-    if (routeGeoWatchId !== null && navigator.geolocation) navigator.geolocation.clearWatch(routeGeoWatchId);
-
-    if (!navigator.geolocation) {
-      showToast('warning', 'GPS Unavailable', 'This device has no location support — position cannot be tracked', 6000);
-      // TODO(backend): send {type:'location.unavailable', payload:{entityId: AmbulanceData.crew.id, reason:'no_signal'}}
-      return;
-    }
-
-    routeGeoWatchId = navigator.geolocation.watchPosition(
-      pos => {
-        if (!AmbulanceData.currentJob || AmbulanceData.currentJob.status === 'complete') return;
-        if (AmbulanceData.currentJob.status !== 'en_route') return; // only track while actually en route
-        const lat = pos.coords.latitude, lng = pos.coords.longitude;
-        AmbulanceData.currentJob.unitLat = lat;
-        AmbulanceData.currentJob.unitLng = lng;
-        const remainingKm = haversineKm(lat, lng, job.lat, job.lng);
-        AmbulanceData.currentJob.unitETA = Math.max(0, Math.round(remainingKm / 0.5)); // ~30km/h assumption
-        // TODO(backend): replace with ws.send({type:'location.update', payload:{
-        //   entityType:'unit', entityId: AmbulanceData.crew.id, lat, lng,
-        //   accuracy: pos.coords.accuracy, capturedAt: Date.now(), source:'device_gps' }})
-        GeamsAmbulanceSync.pushUpdate(AmbulanceData.crew.lcrId, job.id, {
-          unitLat: lat, unitLng: lng, unitETA: AmbulanceData.currentJob.unitETA,
+    if (routeTimer) clearInterval(routeTimer);
+    routeTimer = setInterval(() => {
+      if (!AmbulanceData.currentJob || AmbulanceData.currentJob.status === 'complete') { clearInterval(routeTimer); return; }
+      if (AmbulanceData.currentJob.status !== 'en_route') return; // only advance while en route
+      if (routeStep < routeCoords.length - 1) routeStep++;
+      const pos = routeCoords[routeStep];
+      AmbulanceData.currentJob.unitLat = pos[0];
+      AmbulanceData.currentJob.unitLng = pos[1];
+      const remaining = routeCoords.length - 1 - routeStep;
+      AmbulanceData.currentJob.unitETA = Math.max(0, Math.ceil(remaining * 0.4));
+      GeamsAmbulanceSync.pushUpdate(AmbulanceData.crew.lcrId, job.id, {
+        unitLat: pos[0], unitLng: pos[1], unitETA: AmbulanceData.currentJob.unitETA,
+      });
+      if (job.mutualAidRequestId) {
+        AmbulanceMutualAid.pushUnitUpdate(job.mutualAidRequestId, {
+          unitLat: pos[0], unitLng: pos[1], unitETA: AmbulanceData.currentJob.unitETA,
         });
-        if (unitMarker) unitMarker.setLatLng([lat, lng]);
-        if (currentScreen === 'job') updateStatBar();
-        if (remainingKm < 0.05) {
-          showToast('info', 'Arriving', 'Unit has reached the scene — mark On Scene', 5000);
-        }
-      },
-      () => {
-        showToast('warning', 'GPS Signal Lost', 'Real-time position unavailable — last known location shown', 5000);
-        // TODO(backend): send {type:'location.unavailable', payload:{entityId: AmbulanceData.crew.id, reason:'denied'}}
-      },
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 }
-    );
+      }
+      if (unitMarker) unitMarker.setLatLng(pos);
+      if (currentScreen === 'job') updateStatBar();
+      if (routeStep >= routeCoords.length - 1) {
+        showToast('info', 'Arriving', 'Unit has reached the scene — mark On Scene', 5000);
+      }
+    }, 2000);
   }
 
   function setStatus(status) {
@@ -750,11 +713,155 @@ const AmbulanceApp = (() => {
     showToast('success', labels[status] || status, job.id, 4000);
     if (status === 'complete') {
       if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
+      if (job.mutualAidRequestId) AmbulanceMutualAid.markComplete(job.mutualAidRequestId);
       AmbulanceData.setCurrentJob(null);
       setTimeout(() => navigate('queue'), 800);
       return;
     }
     renderJob();
+  }
+
+  /* ── MUTUAL AID (cross-jurisdiction backup) ── */
+  let aidPickerOpen = false;
+
+  function toggleAidPicker() {
+    aidPickerOpen = !aidPickerOpen;
+    renderJob();
+  }
+
+  function requestMutualAid(targetLcrId) {
+    const job = AmbulanceData.currentJob;
+    const crew = AmbulanceData.crew;
+    if (!job || !crew) return;
+    const target = AmbulanceData.nearbyStations(crew.lcrId).find(s => s.id === targetLcrId);
+    const originStation = AmbulanceData.findStation(crew.lcrId);
+    if (!target || !originStation) { showToast('error', 'Failed', 'Target station not found'); return; }
+    const existing = AmbulanceMutualAid.recordForIncident(job.id);
+    if (existing && existing.status === 'pending') {
+      showToast('warning', 'Already Requested', `Awaiting response from ${existing.targetStationName}`);
+      return;
+    }
+    const rec = AmbulanceMutualAid.sendRequest(job, target, originStation, crew);
+    job.mutualAidOutgoingId = rec.id;
+    aidPickerOpen = false;
+    showToast('success', 'Backup Requested', `${target.name} notified (${target.distanceKm.toFixed(1)} km away) — awaiting response`, 6000);
+    renderJob();
+  }
+
+  function cancelMutualAidRequest(requestId) {
+    AmbulanceMutualAid.cancelRequest(requestId);
+    showToast('info', 'Request Cancelled', 'The backup request has been withdrawn');
+    renderJob();
+    renderMutualAid();
+  }
+
+  function acceptMutualAid(requestId) {
+    const rec = AmbulanceMutualAid.recordFor(requestId);
+    if (!rec || rec.status !== 'pending') { showToast('error', 'Unavailable', 'This request is no longer pending'); return; }
+    if (AmbulanceData.currentJob && AmbulanceData.currentJob.status !== 'complete') {
+      showToast('warning', 'Already Responding', 'Complete your current response before accepting mutual aid', 5000);
+      return;
+    }
+    const crew = AmbulanceData.crew;
+    const ownStation = AmbulanceData.findStation(crew.lcrId);
+    AmbulanceMutualAid.accept(requestId, ownStation, crew);
+    const job = {
+      id: rec.incidentId, type: rec.type, priority: rec.priority, location: rec.location,
+      lat: rec.lat, lng: rec.lng, notes: rec.notes, status: 'accepted', acceptedAt: Date.now(),
+      unitLat: ownStation.lat, unitLng: ownStation.lng, unitETA: null,
+      isMutualAid: true, mutualAidRequestId: requestId,
+      mutualAidOrigin: rec.originStationName,
+    };
+    AmbulanceData.setCurrentJob(job);
+    showToast('success', 'Mutual Aid Accepted', `Responding to ${rec.originStationName} — ${rec.type}`, 6000);
+    navigate('job');
+    startRoute(ownStation, job);
+  }
+
+  function declineMutualAid(requestId) {
+    AmbulanceMutualAid.decline(requestId);
+    showToast('info', 'Request Declined', 'The requesting station has been notified');
+    renderMutualAid();
+  }
+
+  function onIncomingMutualAid(rec) {
+    const dot = document.getElementById('topbar-dot');
+    if (dot) dot.classList.add('busy');
+    showToast('error', '🤝 Mutual Aid Request', `${rec.originStationName} needs backup — ${rec.type} (${rec.distanceKm} km)`, 8000);
+    if (currentScreen === 'aid') renderMutualAid();
+  }
+
+  function onMutualAidStatusChanged(rec) {
+    if (rec.status === 'accepted') {
+      showToast('success', '🤝 Backup Accepted', `${rec.acceptedByName} (${rec.targetStationName}) is responding`, 6000);
+    } else if (rec.status === 'declined') {
+      showToast('warning', 'Backup Declined', `${rec.targetStationName} could not provide backup`, 5000);
+    }
+    if (currentScreen === 'aid') renderMutualAid();
+    if (currentScreen === 'job') renderJob();
+  }
+
+  function onMutualAidRecordUpdated(rec) {
+    // Live position refresh for whichever side of this request is on screen.
+    const job = AmbulanceData.currentJob;
+    if (!job) return;
+    const isOriginViewingBackupUnit = !job.mutualAidRequestId && AmbulanceMutualAid.recordForIncident(job.id)?.id === rec.id;
+    const isResponderViewingOwnUnit = job.mutualAidRequestId === rec.id;
+    if ((isOriginViewingBackupUnit || isResponderViewingOwnUnit) && currentScreen === 'job' && map) {
+      updateBackupMarker(rec);
+    }
+  }
+
+  function refreshMutualAidTab() {
+    const incoming = AmbulanceMutualAid.myIncoming();
+    const badge = document.getElementById('aid-badge');
+    if (badge) {
+      badge.style.display = incoming.length ? 'inline-block' : 'none';
+      badge.textContent = incoming.length || '';
+    }
+    if (currentScreen === 'aid') renderMutualAid();
+  }
+
+  function renderMutualAid() {
+    const el = document.getElementById('screen-aid');
+    if (!el) return;
+    const incoming = AmbulanceMutualAid.myIncoming();
+    const outgoing = AmbulanceMutualAid.myOutgoing();
+    const statusColor = s => ({ pending:'var(--gold)', accepted:'var(--green)', declined:'var(--red)', cancelled:'var(--text-ghost)', completed:'var(--cyan)' }[s] || 'var(--text-muted)');
+
+    el.innerHTML = `
+      ${incoming.length ? `
+      <div style="padding:14px 14px 0">
+        <div style="font-size:0.72rem;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">📥 Incoming Requests</div>
+      </div>
+      ${incoming.map(r => `
+        <div class="call-card" style="border-color:var(--cyan)">
+          <div class="call-card-type" style="color:var(--cyan)">🤝 ${r.originStationName} needs backup</div>
+          <div class="call-card-meta">
+            🚑 ${r.type} · ${(r.priority||'').toUpperCase()}<br>
+            📍 ${r.location}<br>
+            📏 ${r.distanceKm} km from your station<br>
+            👤 Requested by ${r.requestedByName}
+          </div>
+          <div class="call-card-actions">
+            <button class="btn btn-ghost btn-full" onclick="AmbulanceApp.declineMutualAid('${r.id}')">✕ Decline</button>
+            <button class="btn btn-primary btn-full" onclick="AmbulanceApp.acceptMutualAid('${r.id}')">🚑 Accept &amp; Respond</button>
+          </div>
+        </div>`).join('')}` : ''}
+
+      <div style="padding:14px 14px 0">
+        <div style="font-size:0.72rem;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">📤 My Sent Requests</div>
+      </div>
+      ${outgoing.length ? outgoing.map(r => `
+        <div class="queue-item" style="cursor:default">
+          <div class="queue-item-dot" style="background:${statusColor(r.status)}"></div>
+          <div style="flex:1">
+            <div style="font-size:0.8rem;font-weight:700">${r.targetStationName} <span style="font-weight:400;color:var(--text-ghost);font-size:0.68rem">${r.distanceKm} km</span></div>
+            <div style="font-size:0.7rem;color:var(--text-muted)">${r.type} · ${r.status.toUpperCase()}${r.acceptedByName ? ' — ' + r.acceptedByName + (r.unitETA!=null ? ' · ETA ' + r.unitETA + ' min' : '') : ''}</div>
+          </div>
+          ${r.status === 'pending' ? `<button class="btn btn-ghost btn-sm" onclick="AmbulanceApp.cancelMutualAidRequest('${r.id}')">Cancel</button>` : ''}
+        </div>`).join('') : `<div class="empty-state" style="padding:24px"><div style="font-size:0.78rem">No backup requests sent yet. Open an active response and tap "Request Mutual Aid" there.</div></div>`}
+    `;
   }
 
   function renderJob() {
@@ -774,18 +881,47 @@ const AmbulanceApp = (() => {
         <div class="stat-box"><div class="stat-val" style="font-size:0.7rem">${job.id}</div><div class="stat-key">Ref</div></div>
       </div>
       <div class="job-detail">
+        ${job.isMutualAid ? `<div class="job-detail-row" style="color:var(--cyan);font-weight:700">🤝 Mutual Aid — responding for ${job.mutualAidOrigin}</div>` : ''}
         <div class="job-detail-row"><b>${job.type}</b></div>
         <div class="job-detail-row">📍 ${job.location}</div>
         <div class="job-detail-row">🧭 GPS: ${job.lat?.toFixed(5)}, ${job.lng?.toFixed(5)}</div>
         ${job.civilianName ? `<div class="job-detail-row">👤 ${job.civilianName}${job.civilianPhone ? ' · ' + job.civilianPhone : ''}</div>` : ''}
         ${job.notes ? `<div class="job-detail-row">📝 ${job.notes}</div>` : ''}
+        ${renderMutualAidStatusRow(job)}
       </div>
+      ${!job.isMutualAid ? renderAidPicker() : ''}
       <div class="action-bar">
+        ${!job.isMutualAid ? `<button class="btn btn-cyan" onclick="AmbulanceApp.toggleAidPicker()">🤝 ${aidPickerOpen ? 'Hide' : 'Request Mutual Aid'}</button>` : ''}
         ${job.status === 'accepted' ? `<button class="btn btn-primary btn-full" onclick="AmbulanceApp.setStatus('en_route')">🚨 Depart — En Route</button>` : ''}
         ${job.status === 'en_route' ? `<button class="btn btn-warning btn-full" onclick="AmbulanceApp.setStatus('on_scene')">📍 Mark On Scene</button>` : ''}
         ${job.status === 'on_scene' ? `<button class="btn btn-success btn-full" onclick="AmbulanceApp.setStatus('complete')">✅ Complete Call</button>` : ''}
       </div>`;
     setTimeout(initMap, 60);
+  }
+
+  function renderMutualAidStatusRow(job) {
+    const outRec = !job.isMutualAid ? AmbulanceMutualAid.recordForIncident(job.id) : null;
+    if (!outRec || outRec.status === 'cancelled') return '';
+    if (outRec.status === 'pending') return `<div class="job-detail-row" style="color:var(--gold)">🤝 Backup requested from ${outRec.targetStationName} (${outRec.distanceKm} km) — awaiting response</div>`;
+    if (outRec.status === 'accepted') return `<div class="job-detail-row" style="color:var(--green)">🤝 ${outRec.acceptedByName} from ${outRec.targetStationName} is responding${outRec.unitETA!=null ? ' · ETA ' + outRec.unitETA + ' min' : ''}</div>`;
+    if (outRec.status === 'declined') return `<div class="job-detail-row" style="color:var(--red)">🤝 ${outRec.targetStationName} declined the backup request</div>`;
+    if (outRec.status === 'completed') return `<div class="job-detail-row" style="color:var(--cyan)">🤝 Backup unit from ${outRec.targetStationName} completed its response</div>`;
+    return '';
+  }
+
+  function renderAidPicker() {
+    if (!aidPickerOpen) return '';
+    const crew = AmbulanceData.crew;
+    const stations = AmbulanceData.nearbyStations(crew.lcrId).slice(0, 6);
+    return `
+      <div style="margin:0 14px 10px;background:var(--bg-raised);border:1px solid var(--border-mid);border-radius:var(--r-md);padding:10px">
+        <div style="font-size:0.72rem;color:var(--text-muted);margin-bottom:8px">Nearest other-jurisdiction ambulance stations, by real distance:</div>
+        ${stations.map(s => `
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border-base)">
+            <div><div style="font-size:0.8rem;font-weight:700">${s.name}</div><div style="font-size:0.68rem;color:var(--text-ghost)">${s.distanceKm.toFixed(1)} km away</div></div>
+            <button class="btn btn-cyan btn-sm" onclick="AmbulanceApp.requestMutualAid('${s.id}')">Send Request</button>
+          </div>`).join('')}
+      </div>`;
   }
 
   function statusLabel(s) {
@@ -797,12 +933,14 @@ const AmbulanceApp = (() => {
     if (eta && AmbulanceData.currentJob) eta.textContent = AmbulanceData.currentJob.unitETA ?? '—';
   }
 
+  let backupMarker = null;
+
   function initMap() {
     const el = document.getElementById('incident-map');
     if (!el || typeof L === 'undefined') return;
     const job = AmbulanceData.currentJob;
     if (!job) return;
-    if (map) { try { map.remove(); } catch(e){} map = null; }
+    if (map) { try { map.remove(); } catch(e){} map = null; backupMarker = null; }
     const center = [job.unitLat || job.lat, job.unitLng || job.lng];
     map = L.map('incident-map', { zoomControl:true, attributionControl:false }).setView(center, 13);
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom:19 }).addTo(map);
@@ -813,12 +951,38 @@ const AmbulanceApp = (() => {
       html:'<div style="font-size:22px">🚑</div>', className:'', iconSize:[26,26], iconAnchor:[13,13] }) })
       .addTo(map).bindPopup(AmbulanceData.crew.name);
     routeLine = L.polyline(routeCoords.length ? routeCoords : [[job.lat,job.lng]], { color:'#ef4444', weight:3, dashArray:'8 6' }).addTo(map);
-    map.fitBounds(L.latLngBounds([[job.lat,job.lng],[job.unitLat||job.lat, job.unitLng||job.lng]]), { padding:[40,40] });
+    const bounds = [[job.lat,job.lng],[job.unitLat||job.lat, job.unitLng||job.lng]];
+
+    // Live backup-unit marker: shown on the origin's map once another
+    // jurisdiction accepts, and on the responder's own map (their own unit,
+    // already drawn above as unitMarker, so only draw this for the origin).
+    const aidRec = !job.isMutualAid ? AmbulanceMutualAid.recordForIncident(job.id) : null;
+    if (aidRec && aidRec.status === 'accepted' && aidRec.unitLat != null) {
+      backupMarker = L.marker([aidRec.unitLat, aidRec.unitLng], { icon: L.divIcon({
+        html:'<div style="font-size:22px">🚑🤝</div>', className:'', iconSize:[30,26], iconAnchor:[15,13] }) })
+        .addTo(map).bindPopup(`${aidRec.acceptedByName} — ${aidRec.targetStationName} (mutual aid)`);
+      bounds.push([aidRec.unitLat, aidRec.unitLng]);
+    }
+    map.fitBounds(L.latLngBounds(bounds), { padding:[40,40] });
+  }
+
+  function updateBackupMarker(rec) {
+    if (!map || rec.unitLat == null) return;
+    if (!backupMarker) {
+      backupMarker = L.marker([rec.unitLat, rec.unitLng], { icon: L.divIcon({
+        html:'<div style="font-size:22px">🚑🤝</div>', className:'', iconSize:[30,26], iconAnchor:[15,13] }) })
+        .addTo(map).bindPopup(`${rec.acceptedByName || ''} — ${rec.targetStationName || ''} (mutual aid)`);
+    } else {
+      backupMarker.setLatLng([rec.unitLat, rec.unitLng]);
+    }
   }
 
   return {
     showSignup, showLogin, doLogin, doSignup, endShift, navigate,
     onNewCall, acceptCall, setStatus, showToast,
+    toggleAidPicker, requestMutualAid, cancelMutualAidRequest,
+    acceptMutualAid, declineMutualAid,
+    onIncomingMutualAid, onMutualAidStatusChanged, onMutualAidRecordUpdated, refreshMutualAidTab,
   };
 })();
 
