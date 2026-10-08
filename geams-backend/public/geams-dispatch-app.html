@@ -957,13 +957,24 @@ const GeamsSync = (() => {
    same-person threshold.
    ============================================================ */
 const FaceEngine = (() => {
-  const LIB_URL   = 'https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js';
+  // Both the library and the model weights come from the same CDN
+  // (jsdelivr) so there is only one third-party host in the loading path —
+  // fewer places a firewall/ad-blocker on either end's network can break this.
+  const LIB_URL   = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js';
   const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+  const LOAD_TIMEOUT_MS = 20000;
   const MATCH_THRESHOLD = 0.6;
 
   let modelsLoaded = false;
-  let loadFailed = false;
   let loadingPromise = null;
+  let lastError = null;
+
+  function withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms)),
+    ]);
+  }
 
   function ensureLibLoaded() {
     if (window.faceapi) return Promise.resolve();
@@ -971,29 +982,34 @@ const FaceEngine = (() => {
       const s = document.createElement('script');
       s.src = LIB_URL;
       s.onload = () => resolve();
-      s.onerror = () => reject(new Error('face-api.js failed to load'));
+      s.onerror = () => reject(new Error('Could not load the face recognition library from ' + LIB_URL + ' — the CDN may be blocked on this network.'));
       document.head.appendChild(s);
     });
   }
 
+  // A failed attempt is never cached permanently — a dropped packet or a
+  // slow connection on the first try must not lock this out for the rest
+  // of the page session; the next call (or a Retry tap) does a real retry.
   function ensureModels() {
     if (modelsLoaded) return Promise.resolve(true);
-    if (loadFailed) return Promise.resolve(false);
     if (loadingPromise) return loadingPromise;
     loadingPromise = (async () => {
       try {
-        await ensureLibLoaded();
-        await Promise.all([
+        await withTimeout(ensureLibLoaded(), LOAD_TIMEOUT_MS, 'Face recognition library');
+        await withTimeout(Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-        ]);
+        ]), LOAD_TIMEOUT_MS, 'Face recognition model download');
         modelsLoaded = true;
+        lastError = null;
         return true;
       } catch (e) {
         console.warn('[FaceEngine] could not load face recognition models:', e.message || e);
-        loadFailed = true;
+        lastError = (e && e.message) ? e.message : String(e);
         return false;
+      } finally {
+        if (!modelsLoaded) loadingPromise = null;
       }
     })();
     return loadingPromise;
@@ -1043,7 +1059,8 @@ const FaceEngine = (() => {
   return {
     ensureModels, watchVideo, distance, isMatch, findBestMatch, MATCH_THRESHOLD,
     get ready() { return modelsLoaded; },
-    get failed() { return loadFailed; },
+    get failed() { return !modelsLoaded && lastError !== null; },
+    get lastError() { return lastError; },
   };
 })();
 
@@ -2183,6 +2200,18 @@ const DispatchApp = (() => {
     const area = document.getElementById('scan-camera-area');
     const status = document.getElementById('scan-status');
     if (!area) return;
+    // Stop any previous stream/watch first (e.g. a Retry tap after a
+    // failed model load) so we never pile up multiple open camera streams.
+    if (_scanStopWatch) { _scanStopWatch(); _scanStopWatch = null; }
+    if (_scanStream) { _scanStream.getTracks().forEach(t => t.stop()); _scanStream = null; }
+    if (!window.isSecureContext) {
+      area.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;text-align:center;padding:20px;line-height:1.5">
+        🔒 Camera access requires this page to be opened over <b>https://</b> (or localhost).
+        This looks like it's open as a local file or over plain http — host it on a real https://
+        address and open it from there.</div>`;
+      if (status) status.textContent = '';
+      return;
+    }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       area.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;text-align:center;padding:20px">📷 Camera not available on this device/browser.</div>`;
       if (status) status.textContent = '';
@@ -2200,10 +2229,13 @@ const DispatchApp = (() => {
     const video = document.getElementById('scan-video');
     if (video) video.srcObject = _scanStream;
 
+    if (status) status.textContent = 'Loading face recognition model…';
     const modelsReady = await FaceEngine.ensureModels();
     if (!document.getElementById('scan-camera-area')) return; // sheet closed meanwhile
     if (!modelsReady) {
-      if (status) status.innerHTML = '<span style="color:var(--red)">⚠️ Could not load the face recognition model (check internet connection).</span>';
+      if (status) status.innerHTML = `<span style="color:var(--red)">⚠️ Could not load the face recognition model.</span>
+        <div style="font-size:0.68rem;color:var(--text-muted);margin-top:4px">${FaceEngine.lastError || 'Unknown error'}</div>`;
+      area.innerHTML += `<div style="text-align:center;margin-top:8px"><button class="btn btn-primary" style="padding:8px 20px" onclick="DispatchApp.startScanCamera()">↻ Retry</button></div>`;
       return;
     }
     if (status) status.textContent = 'Point the camera at the subject\'s face…';
