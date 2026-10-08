@@ -748,13 +748,25 @@ const GeamsSync = (() => {
    cut-off, not a number we invented.
    ============================================================ */
 const FaceEngine = (() => {
-  const LIB_URL   = 'https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js';
+  // Both the library and the model weights are served from the same CDN
+  // (jsdelivr) so there is only one third-party host in the loading path
+  // instead of two — fewer places a corporate/mobile-network firewall or
+  // ad-blocker can silently break this feature.
+  const LIB_URL   = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js';
   const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+  const LOAD_TIMEOUT_MS = 20000;
   const MATCH_THRESHOLD = 0.6; // face-api.js documented same-person cutoff
 
   let modelsLoaded = false;
-  let loadFailed = false;
   let loadingPromise = null;
+  let lastError = null; // real diagnostic detail for whatever actually failed, not just "check internet"
+
+  function withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms)),
+    ]);
+  }
 
   function ensureLibLoaded() {
     if (window.faceapi) return Promise.resolve();
@@ -762,29 +774,39 @@ const FaceEngine = (() => {
       const s = document.createElement('script');
       s.src = LIB_URL;
       s.onload = () => resolve();
-      s.onerror = () => reject(new Error('face-api.js failed to load'));
+      s.onerror = () => reject(new Error('Could not load the face recognition library from ' + LIB_URL + ' — the CDN may be blocked on this network.'));
       document.head.appendChild(s);
     });
   }
 
+  // Deliberately does NOT cache a permanent failure: a dropped packet, a
+  // slow mobile connection, or a momentary CDN hiccup on the first attempt
+  // must not lock out every later attempt for the rest of the page's
+  // lifetime. Only a genuine in-progress load is reused; a failed attempt
+  // is cleared so the very next call retries the real network request.
   function ensureModels() {
     if (modelsLoaded) return Promise.resolve(true);
-    if (loadFailed) return Promise.resolve(false);
     if (loadingPromise) return loadingPromise;
     loadingPromise = (async () => {
       try {
-        await ensureLibLoaded();
-        await Promise.all([
+        await withTimeout(ensureLibLoaded(), LOAD_TIMEOUT_MS, 'Face recognition library');
+        await withTimeout(Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-        ]);
+        ]), LOAD_TIMEOUT_MS, 'Face recognition model download');
         modelsLoaded = true;
+        lastError = null;
         return true;
       } catch (e) {
         console.warn('[FaceEngine] could not load face recognition models:', e.message || e);
-        loadFailed = true;
+        lastError = (e && e.message) ? e.message : String(e);
         return false;
+      } finally {
+        // Always clear so a later retry (e.g. the user tapping the Retry
+        // button, or opening the sheet again) does a fresh network attempt
+        // instead of replaying a cached failure.
+        if (!modelsLoaded) loadingPromise = null;
       }
     })();
     return loadingPromise;
@@ -823,7 +845,8 @@ const FaceEngine = (() => {
   return {
     ensureModels, watchVideo, distance, isMatch, MATCH_THRESHOLD,
     get ready() { return modelsLoaded; },
-    get failed() { return loadFailed; },
+    get failed() { return !modelsLoaded && lastError !== null; },
+    get lastError() { return lastError; },
   };
 })();
 
@@ -2476,26 +2499,49 @@ const CivilianApp = (() => {
       <button class="btn btn-primary btn-full" onclick="CivilianApp.runFingerprintScan()">Start Scan</button>`;
   }
 
+  // Human-readable reason for every WebAuthn error name the spec defines,
+  // instead of one generic "cancelled or failed" message — so a real
+  // failure on an actual device is diagnosable instead of a dead end.
+  function describeWebAuthnError(e) {
+    switch (e && e.name) {
+      case 'NotAllowedError': return 'You cancelled the biometric prompt, declined it, or it timed out.';
+      case 'SecurityError': return "This page's address isn't allowed to register a biometric credential here (e.g. not a proper https:// domain).";
+      case 'NotSupportedError': return 'This browser reports biometric support but could not actually complete the request — it may not be fully implemented here (common inside some in-app/embedded browsers). Try your device\'s regular browser (Chrome, Safari) directly.';
+      case 'InvalidStateError': return 'A credential already exists for this account on this device.';
+      case 'AbortError': return 'The request was cancelled.';
+      case 'ConstraintError': return "This device's authenticator could not satisfy the requested security options.";
+      case 'ClientTimeout': return 'No response from the device in time.';
+      default: return e && e.message ? e.message : 'The device declined to create a biometric credential.';
+    }
+  }
+
   async function runFingerprintScan() {
     const body = document.getElementById('fp-enrol-body');
     const footer = document.getElementById('sheet-footer');
     if (footer) footer.innerHTML = `<button class="btn btn-ghost" disabled>Waiting for device…</button>`;
     try {
-      const credential = await navigator.credentials.create({
-        publicKey: {
-          challenge: randomChallenge(),
-          rp: { name: 'GEAMS Civilian' },
-          user: {
-            id: new TextEncoder().encode(CivilianData.user.id || ('civ-' + Date.now())),
-            name: CivilianData.user.phone || CivilianData.user.id,
-            displayName: CivilianData.user.name || 'GEAMS User',
+      // We race the real WebAuthn call against our own timeout: some
+      // embedded/in-app browsers accept the call but never resolve or
+      // reject it, which would otherwise leave "Waiting for device…"
+      // on screen forever with no way out.
+      const credential = await Promise.race([
+        navigator.credentials.create({
+          publicKey: {
+            challenge: randomChallenge(),
+            rp: { name: 'GEAMS Civilian' },
+            user: {
+              id: new TextEncoder().encode(CivilianData.user.id || ('civ-' + Date.now())),
+              name: CivilianData.user.phone || CivilianData.user.id,
+              displayName: CivilianData.user.name || 'GEAMS User',
+            },
+            pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+            authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required' },
+            timeout: 30000,
+            attestation: 'none',
           },
-          pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
-          authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required' },
-          timeout: 60000,
-          attestation: 'none',
-        },
-      });
+        }),
+        new Promise((_, reject) => setTimeout(() => { const e = new Error('ClientTimeout'); e.name = 'ClientTimeout'; reject(e); }, 32000)),
+      ]);
       if (!credential) throw new Error('No credential returned');
       // Store only the credential ID (a non-secret handle to the real
       // platform credential) — never a biometric image or template, which
@@ -2510,8 +2556,10 @@ const CivilianApp = (() => {
       if (body) body.innerHTML = `
         <div style="font-size:2.2rem;margin-bottom:10px">✕</div>
         <div style="font-size:0.85rem;color:var(--text-primary);font-weight:600;margin-bottom:6px">Enrolment cancelled or failed</div>
-        <div style="font-size:0.76rem;color:var(--text-muted)">${e.name === 'NotAllowedError' ? 'You cancelled the biometric prompt, or it timed out.' : (e.message || 'The device declined to create a biometric credential.')}</div>`;
-      if (footer) footer.innerHTML = `<button class="btn btn-ghost btn-full" onclick="CivilianApp.closeSheet()">Close</button>`;
+        <div style="font-size:0.76rem;color:var(--text-muted)">${describeWebAuthnError(e)}</div>`;
+      if (footer) footer.innerHTML = `
+        <button class="btn btn-ghost" onclick="CivilianApp.closeSheet()">Close</button>
+        <button class="btn btn-primary btn-full" onclick="CivilianApp.runFingerprintScan()">↻ Try Again</button>`;
     }
   }
 
@@ -2587,6 +2635,10 @@ const CivilianApp = (() => {
     const area = document.getElementById('face-enrol-area');
     const status = document.getElementById('face-enrol-status');
     if (!area) return;
+    // Stop any previous stream/watch first (e.g. a Retry tap after a
+    // failed model load) so we never pile up multiple open camera streams.
+    if (_faceStopWatch) { _faceStopWatch(); _faceStopWatch = null; }
+    if (_faceStream) { _faceStream.getTracks().forEach(t => t.stop()); _faceStream = null; }
     if (!window.isSecureContext) {
       area.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;text-align:center;padding:20px;line-height:1.5">
         🔒 Camera access requires this page to be opened over <b>https://</b> (or localhost).
@@ -2611,10 +2663,17 @@ const CivilianApp = (() => {
     const video = document.getElementById('face-enrol-video');
     if (video) video.srcObject = _faceStream;
 
+    if (status) status.textContent = 'Loading face recognition model…';
     const modelsReady = await FaceEngine.ensureModels();
     if (!document.getElementById('face-enrol-area')) return; // sheet closed meanwhile
     if (!modelsReady) {
-      if (status) status.innerHTML = '<span style="color:var(--red)">⚠️ Could not load the face recognition model (check internet connection) — Face ID cannot be enrolled right now.</span>';
+      // Show the real reason (timeout vs library blocked vs model file
+      // blocked) instead of a dead-end "check your internet" message —
+      // and a real Retry button, since a one-off network hiccup must not
+      // permanently lock this out for the rest of the session.
+      if (status) status.innerHTML = `<span style="color:var(--red)">⚠️ Could not load the face recognition model.</span>
+        <div style="font-size:0.68rem;color:var(--text-muted);margin-top:4px">${FaceEngine.lastError || 'Unknown error'}</div>`;
+      area.innerHTML += `<div style="text-align:center;margin-top:8px"><button class="btn btn-primary" style="padding:8px 20px" onclick="CivilianApp.startFaceEnrolCamera()">↻ Retry</button></div>`;
       return;
     }
     if (status) status.textContent = 'Looking for a face…';
@@ -2975,7 +3034,7 @@ const CivilianApp = (() => {
     stopEvidenceRelayManual, stopEvidenceRelayIfMatching, resumeEvidenceRelay,
     updateEmergencyContacts, editEmergencyContact, saveEmergencyContact, removeEmergencyContact,
     enrolFingerprint, runFingerprintScan, removeFingerprint, verifyFingerprint,
-    enrolFace, captureFaceNow, closeFaceSheet, removeFace,
+    enrolFace, captureFaceNow, closeFaceSheet, removeFace, startFaceEnrolCamera,
     changePin, submitChangePin,
     manageLocationPermissions, saveLocationPermission,
     requestAccountDeletion, confirmAccountDeletion,
