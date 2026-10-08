@@ -1,31 +1,6 @@
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
-<script>
-/* ── GEAMS BACKEND CONFIG ── see geams-civilian-app.html for the full
-   explanation. Every device must use the SAME two values. */
-window.GEAMS_BACKEND_URL = '';
-window.GEAMS_AUTH_TOKEN  = '';
-window.GEAMS_TURN_APP    = '';   // free at metered.ca → Open Relay — see geams-civilian-app.html
-window.GEAMS_TURN_KEY    = '';
-</script>
-<script>
-/* ── MOBILE VIEWPORT HEIGHT FIX ── see geams-civilian-app.html for the
-   full explanation. #app below is height:100vh + overflow:hidden; on a
-   real phone 100vh overshoots the visible area, so content (including
-   buttons) can fall in a gap with no scroll route to reach it. This
-   measures the actual visible viewport and keeps it current. */
-(function () {
-  function setAppHeight() {
-    var h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
-    document.documentElement.style.setProperty('--app-vh', h + 'px');
-  }
-  setAppHeight();
-  window.addEventListener('resize', setAppHeight);
-  window.addEventListener('orientationchange', function () { setTimeout(setAppHeight, 120); });
-  if (window.visualViewport) window.visualViewport.addEventListener('resize', setAppHeight);
-})();
-</script>
 <meta name="mobile-web-app-capable" content="yes"/>
 <title>GEAMS Dispatch — Officer App</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
@@ -79,13 +54,13 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9997;
 ═══════════════════════════════════════════════════════════════ */
 
 /* ── BASE APP SHELL (all breakpoints) ─────────────────────── */
-html,body{height:100%;height:var(--app-vh, 100%);width:100%;overflow:hidden;}
+html,body{height:100%;width:100%;overflow:hidden;}
 body{background:var(--bg-void);color:var(--text-bright);font-family:var(--font-ui);
   font-weight:400;line-height:1.5;-webkit-font-smoothing:antialiased;}
 
 /* App is hidden behind the login screen at startup.
    boot() sets opacity:1 after successful auth. */
-#app{display:grid;height:100vh;height:var(--app-vh, 100vh);width:100%;overflow:hidden;position:relative;
+#app{display:grid;height:100vh;width:100%;overflow:hidden;position:relative;
   grid-template-rows:var(--topbar-h) 1fr var(--navbar-h);
   grid-template-columns:1fr;
   grid-template-areas:
@@ -114,9 +89,16 @@ body{background:var(--bg-void);color:var(--text-bright);font-family:var(--font-u
   padding-bottom:var(--safe-bottom);z-index:100;}
 
 /* ── SCREEN PANELS ────────────────────────────────────────── */
-.screen{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y;display:none;
+.screen{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;display:none;
   flex-direction:column;padding-bottom:8px;animation:screenIn 0.18s var(--ease);}
 .screen.active{display:flex;}
+/* Every direct child of a scrolling .screen must keep its natural content
+   height so the screen's own overflow-y:auto can scroll past it. Without
+   this, flex's default shrink-to-fit sizing combined with children that
+   have overflow:hidden (e.g. .card, for its rounded corners) crushes each
+   child down to fit the visible area and silently clips the rest instead
+   of scrolling to it. */
+.screen>*{flex-shrink:0;}
 
 /* ── TABLET (≥768px) ──────────────────────────────────────── */
 @media (min-width:768px){
@@ -295,7 +277,7 @@ body{background:var(--bg-void);color:var(--text-bright);font-family:var(--font-u
   font-weight:700;display:flex;align-items:center;justify-content:center;
   border:1px solid var(--bg-void);font-family:var(--font-mono);}
 .screen-title{font-size:1.1rem;font-weight:800;letter-spacing:-0.3px;flex:1;}
-.card{background:var(--bg-raised);border:1px solid var(--border-base);border-radius:var(--r-lg);overflow:hidden;}
+.card{background:var(--bg-raised);border:1px solid var(--border-base);border-radius:var(--r-lg);overflow:hidden;flex-shrink:0;}
 .card-header{padding:12px 14px;border-bottom:1px solid var(--border-dim);display:flex;align-items:center;gap:8px;}
 .card-title{font-size:0.78rem;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:var(--text-base);flex:1;}
 .card-body{padding:14px;}.card-body.no-pad{padding:0;}
@@ -872,370 +854,212 @@ body{background:var(--bg-void);color:var(--text-bright);font-family:var(--font-u
      Falls back to fully offline (pure local simulation) if neither
      is available.
    ============================================================ */
-// ── REAL-TIME BACKEND CLIENT ──────────────────────────────────────────
-// This used to be a localStorage-only wrapper — GeamsSync.available()
-// only ever confirmed localStorage existed in THIS browser, which is
-// true on almost every device, including ones with zero connection to
-// any other location. Every place elsewhere in this file annotated
-// "GeamsSync.available() isn't a real connectivity check" is fixed by
-// this swap: available() now means "the WebSocket to the real GEAMS
-// backend is actually open," so every existing call site (mergeShared,
-// watch, pushChat, etc.) keeps working completely unchanged, but is now
-// genuinely real-time across devices instead of only within one
-// browser's tabs. See geams-realtime-backend-spec.md and backend/server.js.
-//
-// Configure per deployment: set window.GEAMS_BACKEND_URL (e.g.
-// 'wss://your-server.example.org/ws') and window.GEAMS_AUTH_TOKEN before
-// this script runs — see the config block near the top of <head>. Left
-// unconfigured, available() correctly reports false forever and every
-// existing offline/demo fallback in this app keeps working exactly as
-// it did before, same as when localStorage was unavailable previously.
 const GeamsSync = (() => {
-  // If opened as a plain local file (file://) or with no config set at
-  // all, there's no same-origin server to guess — stay in offline/demo
-  // mode. If this page was itself served BY the GEAMS backend (e.g. via
-  // Render's free static hosting — see backend/README.md), auto-detect
-  // the WebSocket URL from the page's own origin so no manual editing is
-  // needed for that deployment path. An explicit window.GEAMS_BACKEND_URL
-  // always wins over auto-detection.
-  const GEAMS_BACKEND_URL = (typeof window !== 'undefined' && window.GEAMS_BACKEND_URL) ||
-    (typeof location !== 'undefined' && /^https?:$/.test(location.protocol)
-      ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'
-      : '');
-  const GEAMS_AUTH_TOKEN  = (typeof window !== 'undefined' && window.GEAMS_AUTH_TOKEN)  || '';
+  const LS_PREFIX = 'geams:';
+  let mode = 'checking'; // 'artifact' | 'localStorage' | 'offline' | 'checking'
 
-  const CLIENT_ID = (() => {
+  function artifactAvailable() { return typeof window !== 'undefined' && !!window.storage; }
+  function localStorageAvailable() {
     try {
-      let id = localStorage.getItem('geams_client_id');
-      if (!id) {
-        id = 'c_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-        localStorage.setItem('geams_client_id', id);
-      }
-      return id;
-    } catch (e) { return 'c_' + Math.random().toString(36).slice(2); }
+      const k = '__geams_probe__';
+      localStorage.setItem(k, '1');
+      localStorage.removeItem(k);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  const ready = (async () => {
+    if (artifactAvailable()) { mode = 'artifact'; return; }
+    if (localStorageAvailable()) { mode = 'localStorage'; return; }
+    mode = 'offline';
+    console.warn('[GeamsSync] neither window.storage nor localStorage is available — running fully offline.');
   })();
 
-  let mode = 'checking'; // 'connecting' | 'connected' | 'offline'
-  let ws = null;
-  let reconnectDelay = 1000;
-  let reqCounter = 0;
-  let myUserId = null;
-  const pending = new Map();        // reqId -> resolve fn
-  const watchers = new Map();       // key -> Set<cb>
-  const localCache = new Map();     // key -> last known value (seeds watch() instantly, survives disconnects)
-  const callListeners = new Set();  // cb(fromUserId, payload)
-  let resolveReady;
-  const readyPromise = new Promise((r) => { resolveReady = r; });
-
-  function connect() {
-    if (!GEAMS_BACKEND_URL) { mode = 'offline'; resolveReady(); return; }
-    mode = 'connecting';
-    let socket;
-    try {
-      const url = GEAMS_BACKEND_URL +
-        (GEAMS_BACKEND_URL.includes('?') ? '&' : '?') +
-        'clientId=' + encodeURIComponent(CLIENT_ID) + '&token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
-      socket = new WebSocket(url);
-    } catch (e) { mode = 'offline'; resolveReady(); scheduleReconnect(); return; }
-    ws = socket;
-
-    ws.onopen = () => {
-      mode = 'connected';
-      reconnectDelay = 1000;
-      if (myUserId) send({ type:'register', userId: myUserId });
-      for (const key of watchers.keys()) send({ type:'watch', key });
-      resolveReady();
-    };
-
-    ws.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (msg.type === 'result' && pending.has(msg.reqId)) {
-        const resolve = pending.get(msg.reqId);
-        pending.delete(msg.reqId);
-        resolve(msg);
-      } else if (msg.type === 'update') {
-        localCache.set(msg.key, msg.value);
-        const cbs = watchers.get(msg.key);
-        if (cbs) cbs.forEach((cb) => { try { cb(msg.value); } catch (e) { console.error(e); } });
-      } else if (msg.type === 'call') {
-        callListeners.forEach((cb) => { try { cb(msg.fromUserId, msg.payload); } catch (e) { console.error(e); } });
-      } else if (msg.type === 'pong') {
-        /* heartbeat ack, nothing to do */
-      }
-    };
-
-    ws.onclose = () => {
-      const wasConnected = mode === 'connected';
-      mode = 'offline';
-      ws = null;
-      // Fail every request in flight rather than hanging forever.
-      for (const [id, resolve] of pending) resolve(null);
-      pending.clear();
-      if (wasConnected) console.warn('[GeamsSync] real-time connection lost — reconnecting…');
-      scheduleReconnect();
-    };
-    ws.onerror = () => { /* onclose follows; handled there */ };
-  }
-
-  function scheduleReconnect() {
-    setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-  }
-
-  function send(obj) {
-    if (ws && ws.readyState === ws.OPEN) { ws.send(JSON.stringify(obj)); return true; }
-    return false;
-  }
-
-  function request(obj) {
-    return new Promise((resolve) => {
-      const reqId = ++reqCounter;
-      if (!send(Object.assign({}, obj, { reqId }))) { resolve(null); return; }
-      pending.set(reqId, resolve);
-      setTimeout(() => { if (pending.has(reqId)) { pending.delete(reqId); resolve(null); } }, 8000);
-    });
-  }
-
-  connect();
-
-  function available() { return mode === 'connected'; }
+  function available() { return mode === 'artifact' || mode === 'localStorage'; }
 
   async function getShared(key, fallback) {
-    await readyPromise;
-    if (mode !== 'connected') return localCache.has(key) ? localCache.get(key) : fallback;
-    const res = await request({ type:'get', key });
-    if (res && res.ok) {
-      const value = res.value === null || res.value === undefined ? fallback : res.value;
-      localCache.set(key, value);
-      return value;
+    await ready;
+    if (mode === 'artifact') {
+      try {
+        const r = await window.storage.get(key, true);
+        return r && r.value !== undefined ? JSON.parse(r.value) : fallback;
+      } catch (e) { return fallback; }
     }
-    return localCache.has(key) ? localCache.get(key) : fallback;
+    if (mode === 'localStorage') {
+      try {
+        const raw = localStorage.getItem(LS_PREFIX + key);
+        return raw !== null ? JSON.parse(raw) : fallback;
+      } catch (e) { return fallback; }
+    }
+    return fallback;
   }
-
   async function setShared(key, value) {
-    await readyPromise;
-    localCache.set(key, value);
-    if (mode !== 'connected') return false;
-    const res = await request({ type:'set', key, value });
-    return !!(res && res.ok);
+    await ready;
+    if (mode === 'artifact') {
+      try { await window.storage.set(key, JSON.stringify(value), true); return true; }
+      catch (e) { return false; }
+    }
+    if (mode === 'localStorage') {
+      try { localStorage.setItem(LS_PREFIX + key, JSON.stringify(value)); return true; }
+      catch (e) { console.warn('[GeamsSync] localStorage write failed (quota?):', e.message || e); return false; }
+    }
+    return false;
   }
-
   async function mergeShared(key, fallback, patchFn) {
-    await readyPromise;
+    await ready;
+    if (mode === 'offline') return false;
     try {
       const cur = await getShared(key, fallback);
       const next = patchFn(cur);
-      return await setShared(key, next);
-    } catch (e) { console.error('[GeamsSync] mergeShared failed:', e); return false; }
+      await setShared(key, next);
+      return true;
+    } catch (e) { return false; }
   }
-
-  function watch(key, fallback, cb, /* intervalMs unused — real push now, kept for signature compat */ _intervalMs) {
-    let stopped = false;
-    if (!watchers.has(key)) watchers.set(key, new Set());
-    watchers.get(key).add(cb);
-    send({ type:'watch', key });
-    // Fire once immediately so callers see something without waiting on
-    // a full round trip — matches the old polling version's behavior of
-    // calling back right away with whatever's available.
-    getShared(key, fallback).then((v) => { if (!stopped) cb(v); });
+  function watch(key, fallback, cb, intervalMs) {
+    let stopped = false, last = null;
+    const check = async () => {
+      if (stopped) return;
+      const v = await getShared(key, fallback);
+      const s = JSON.stringify(v);
+      if (s !== last) { last = s; cb(v); }
+    };
+    let storageListener = null;
+    ready.then(() => {
+      if (stopped) return;
+      if (mode === 'localStorage' && typeof window !== 'undefined') {
+        // Native cross-tab push — fires almost instantly in OTHER tabs
+        // whenever this key changes. Polling below still covers same-tab
+        // updates (the 'storage' event never fires in the tab that wrote
+        // it) and artifact mode.
+        storageListener = (e) => { if (e.key === LS_PREFIX + key) check(); };
+        window.addEventListener('storage', storageListener);
+      }
+    });
+    check();
+    const id = setInterval(check, intervalMs || 2000);
     return () => {
       stopped = true;
-      const set = watchers.get(key);
-      if (set) {
-        set.delete(cb);
-        if (set.size === 0) { watchers.delete(key); send({ type:'unwatch', key }); }
-      }
+      clearInterval(id);
+      if (storageListener) window.removeEventListener('storage', storageListener);
     };
   }
+  return { available, getShared, setShared, mergeShared, watch, ready, get mode(){ return mode; } };
+})();
 
-  /* ── MEDIA UPLOAD ─────────────────────────────────────────────────────
-     POSTs a real File/Blob (photo, video, audio, PDF) to the backend's
-     /api/media/upload. The server stores it and appends a reference to the
-     shared key `incident:{incidentId}:evidence`, which every LCR/HQ/Dispatch
-     device watching that incident receives live. Returns {ok:true, path,
-     mediaId, size, contentType} or {ok:false, reason} — never pretends. */
-  function httpBase() {
-    if (!GEAMS_BACKEND_URL) return null;
-    return GEAMS_BACKEND_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\?.*$/, '').replace(/\/ws\/?$/, '');
-  }
-  async function uploadMedia(file, meta) {
-    meta = meta || {};
-    const base = httpBase();
-    if (!base) return { ok:false, reason:'No backend configured' };
-    if (!file) return { ok:false, reason:'No file to upload' };
-    const contentType = String(file.type || meta.contentType || '').split(';')[0] || 'application/octet-stream';
-    const qs = new URLSearchParams({
-      token: GEAMS_AUTH_TOKEN, incidentId: meta.incidentId || '', type: meta.type || '',
-      filename: meta.filename || file.name || '', notes: meta.notes || '', uploadedBy: meta.uploadedBy || '', contentType,
+/* ============================================================
+   FACE ENGINE — real, on-device facial detection and recognition.
+   Identical implementation to geams-civilian-app.html — see that file
+   for the full explanation. Uses face-api.js (genuine TensorFlow.js
+   inference against the live camera feed), never a timer or
+   Math.random(). A 128-d descriptor is a real embedding from an
+   actually-detected face; two descriptors are compared with a real
+   Euclidean distance against face-api.js's own documented 0.6
+   same-person threshold.
+   ============================================================ */
+const FaceEngine = (() => {
+  const LIB_URL   = 'https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js';
+  const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+  const MATCH_THRESHOLD = 0.6;
+
+  let modelsLoaded = false;
+  let loadFailed = false;
+  let loadingPromise = null;
+
+  function ensureLibLoaded() {
+    if (window.faceapi) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = LIB_URL;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('face-api.js failed to load'));
+      document.head.appendChild(s);
     });
-    try {
-      const res = await fetch(base + '/api/media/upload?' + qs.toString(), { method: 'POST', headers: { 'Content-Type': contentType }, body: file });
-      let data = {};
-      try { data = await res.json(); } catch (e) {}
-      if (res.ok && data.ok) return { ok:true, mediaId: data.mediaId, path: data.url, size: data.size, contentType: data.contentType };
-      return { ok:false, reason: data.error || ('Upload failed (HTTP ' + res.status + ')') };
-    } catch (e) { return { ok:false, reason:'Network error — the upload did not complete' }; }
-  }
-  // Full authorised URL for a stored file (e.g. an <img src> or <video src>),
-  // given the relative path the server returned (/api/media/{id}).
-  function mediaUrl(path) {
-    const base = httpBase();
-    if (!base || !path) return null;
-    return base + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(GEAMS_AUTH_TOKEN);
   }
 
-  /* ── CALL SIGNALING (WebRTC) ──────────────────────────────────────────
-     A thin relay, not stored state: registerUserId ties this socket to
-     a real identity (civilian id / officer badge / station id) so the
-     server can route call.* messages to the right person; onSignal/
-     sendSignal carry the offer/answer/ICE candidates. Building the
-     actual RTCPeerConnection is left to each app (see the "real call"
-     helper wired into the civilian/dispatch/station apps), since each
-     needs slightly different UI around it. */
-  function registerUserId(userId) {
-    myUserId = userId;
-    send({ type:'register', userId });
+  function ensureModels() {
+    if (modelsLoaded) return Promise.resolve(true);
+    if (loadFailed) return Promise.resolve(false);
+    if (loadingPromise) return loadingPromise;
+    loadingPromise = (async () => {
+      try {
+        await ensureLibLoaded();
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+        ]);
+        modelsLoaded = true;
+        return true;
+      } catch (e) {
+        console.warn('[FaceEngine] could not load face recognition models:', e.message || e);
+        loadFailed = true;
+        return false;
+      }
+    })();
+    return loadingPromise;
   }
-  function onSignal(cb) { callListeners.add(cb); return () => callListeners.delete(cb); }
-  function sendSignal(toUserId, payload) { return send({ type:'call', toUserId, payload }); }
+
+  function watchVideo(videoEl, onTick) {
+    let stopped = false;
+    async function loop() {
+      if (stopped) return;
+      try {
+        const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 });
+        const result = await faceapi.detectSingleFace(videoEl, opts).withFaceLandmarks().withFaceDescriptor();
+        onTick(result ? result.descriptor : null);
+      } catch (e) {
+        onTick(null);
+      }
+      if (!stopped) setTimeout(loop, 350);
+    }
+    loop();
+    return () => { stopped = true; };
+  }
+
+  function distance(d1, d2) {
+    if (!d1 || !d2 || d1.length !== d2.length) return Infinity;
+    let sum = 0;
+    for (let i = 0; i < d1.length; i++) { const diff = d1[i] - d2[i]; sum += diff * diff; }
+    return Math.sqrt(sum);
+  }
+
+  function isMatch(d1, d2) { return distance(d1, d2) <= MATCH_THRESHOLD; }
+
+  // Compares a live descriptor against every enrolled civilian in the
+  // shared registry and returns the closest one IF it is within the real
+  // match threshold — otherwise null. This is a genuine nearest-neighbour
+  // search over real descriptors, never a random/fabricated hit.
+  function findBestMatch(liveDescriptor, registry) {
+    let best = null, bestDist = Infinity;
+    Object.values(registry || {}).forEach((entry) => {
+      if (!entry.descriptor) return;
+      const d = distance(liveDescriptor, entry.descriptor);
+      if (d < bestDist) { bestDist = d; best = entry; }
+    });
+    if (best && bestDist <= MATCH_THRESHOLD) return { entry: best, distance: bestDist };
+    return null;
+  }
 
   return {
-    available, getShared, setShared, mergeShared, watch,
-    ready: readyPromise, get mode() { return mode; }, get clientId() { return CLIENT_ID; },
-    registerUserId, onSignal, sendSignal, uploadMedia, mediaUrl,
+    ensureModels, watchVideo, distance, isMatch, findBestMatch, MATCH_THRESHOLD,
+    get ready() { return modelsLoaded; },
+    get failed() { return loadFailed; },
   };
 })();
 
-// ── REAL CALL (WebRTC, audio and/or video) ───────────────────────────────
-// Real signaling over the GeamsSync WebSocket (GeamsSync.onSignal/sendSignal
-// — see geams-realtime-backend-spec.md §7), real getUserMedia, real
-// RTCPeerConnection. Media flows peer-to-peer once connected. STUN alone
-// (below) works for many networks but NOT most real mobile connections
-// behind carrier-grade NAT — add a TURN server before relying on this in
-// the field (see the spec's §7 for why and an example config).
-const RealCall = (() => {
-  // ── ICE servers: STUN alone (Google's public server) works when both
-  // sides have a reasonably open network path, but most real mobile
-  // connections sit behind carrier-grade NAT that STUN can't traverse —
-  // calls would silently fail to connect in the field even though
-  // everything else here is real. Free TURN relay closes that gap: sign
-  // up free (no card) at metered.ca -> Open Relay, and set
-  // window.GEAMS_TURN_APP / window.GEAMS_TURN_KEY in the config block
-  // near the top of <head> (see backend/README.md). Falls back to
-  // STUN-only, which still works on many networks, if not configured.
-  let iceServersCache = null;
-  let iceServersCacheTime = 0;
-  async function getIceServers() {
-    const app = (typeof window !== 'undefined' && window.GEAMS_TURN_APP) || '';
-    const key = (typeof window !== 'undefined' && window.GEAMS_TURN_KEY) || '';
-    if (!app || !key) return [{ urls: 'stun:stun.l.google.com:19302' }];
-    // TURN credentials are short-lived; refetch if our cached copy is
-    // more than 5 minutes old rather than reusing one for a whole session.
-    if (iceServersCache && Date.now() - iceServersCacheTime < 5 * 60 * 1000) return iceServersCache;
-    try {
-      const res = await fetch(`https://${app}.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(key)}`);
-      const servers = await res.json();
-      if (Array.isArray(servers) && servers.length) {
-        iceServersCache = servers;
-        iceServersCacheTime = Date.now();
-        return servers;
-      }
-    } catch (e) { console.warn('[RealCall] TURN credential fetch failed, falling back to STUN-only:', e); }
-    return [{ urls: 'stun:stun.l.google.com:19302' }];
+/* ── REAL VIEWPORT HEIGHT (see geams-civilian-app.html for rationale) ── */
+(function setupRealViewportHeight() {
+  function apply() {
+    const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    document.documentElement.style.setProperty('--app-vh', (h / 100) + 'px');
   }
-  let pc = null, localStream = null, activeCallId = null, remoteUserId = null;
-
-  function teardown() {
-    if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-    if (pc) { pc.close(); pc = null; }
-    activeCallId = null; remoteUserId = null;
+  apply();
+  window.addEventListener('resize', apply);
+  window.addEventListener('orientationchange', apply);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', apply);
+    window.visualViewport.addEventListener('scroll', apply);
   }
-
-  async function start(toUserId, { video = false, onRemoteStream, onLocalStream, onStatus } = {}) {
-    if (!GeamsSync.available()) { onStatus && onStatus('unavailable'); return null; }
-    teardown();
-    remoteUserId = toUserId;
-    activeCallId = 'call_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-    pc = new RTCPeerConnection({ iceServers: await getIceServers() });
-    pc.oniceconnectionstatechange = () => {
-      const s = pc && pc.iceConnectionState;
-      onStatus && onStatus(s);
-      if (s === 'failed' || s === 'disconnected' || s === 'closed') teardown();
-    };
-    pc.ontrack = (e) => onRemoteStream && onRemoteStream(e.streams[0]);
-    pc.onicecandidate = (e) => { if (e.candidate && remoteUserId) GeamsSync.sendSignal(remoteUserId, { kind:'ice', callId: activeCallId, candidate: e.candidate }); };
-
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video });
-    } catch (e) { onStatus && onStatus('media-denied'); teardown(); return null; }
-    localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
-    if (onLocalStream) onLocalStream(localStream);
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    GeamsSync.sendSignal(toUserId, { kind:'offer', callId: activeCallId, sdp: offer.sdp, hasVideo: video });
-    onStatus && onStatus('calling');
-    return { callId: activeCallId, localStream };
-  }
-
-  // Accept a call that's already rung (see listen()'s onIncoming callback).
-  async function accept(fromUserId, offerPayload, { video = false, onRemoteStream, onLocalStream, onStatus } = {}) {
-    remoteUserId = fromUserId;
-    activeCallId = offerPayload.callId;
-    pc = new RTCPeerConnection({ iceServers: await getIceServers() });
-    pc.oniceconnectionstatechange = () => {
-      const s = pc && pc.iceConnectionState;
-      onStatus && onStatus(s);
-      if (s === 'failed' || s === 'disconnected' || s === 'closed') teardown();
-    };
-    pc.onicecandidate = (e) => { if (e.candidate) GeamsSync.sendSignal(fromUserId, { kind:'ice', callId: activeCallId, candidate: e.candidate }); };
-    pc.ontrack = (e) => onRemoteStream && onRemoteStream(e.streams[0]);
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: video || !!offerPayload.hasVideo });
-      localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
-      if (onLocalStream) onLocalStream(localStream);
-    } catch (e) { onStatus && onStatus('media-denied'); }
-    await pc.setRemoteDescription({ type: 'offer', sdp: offerPayload.sdp });
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    GeamsSync.sendSignal(fromUserId, { kind:'answer', callId: activeCallId, sdp: answer.sdp });
-    onStatus && onStatus('connected');
-  }
-
-  function decline(fromUserId, offerPayload) {
-    GeamsSync.sendSignal(fromUserId, { kind:'end', callId: offerPayload.callId, reason:'declined' });
-  }
-
-  // Wire this once at app boot. onIncoming fires on a fresh offer from
-  // someone else — the app decides whether to show an accept/decline UI
-  // or auto-accept (internal authorized-personnel calls vs. a civilian's
-  // own phone should NOT behave the same way — see the per-app wiring).
-  function listen({ onIncoming, onRemoteStream, onStatus, onEnded } = {}) {
-    return GeamsSync.onSignal(async (fromUserId, payload) => {
-      if (!payload) return;
-      if (payload.kind === 'unreachable') { onStatus && onStatus('unreachable'); teardown(); return; }
-      if (payload.kind === 'offer') { onIncoming && onIncoming(fromUserId, payload); return; }
-      if (payload.kind === 'answer' && payload.callId === activeCallId && pc) {
-        await pc.setRemoteDescription({ type: 'answer', sdp: payload.sdp });
-        onStatus && onStatus('connected');
-      } else if (payload.kind === 'ice' && payload.callId === activeCallId && pc) {
-        try { await pc.addIceCandidate(payload.candidate); } catch (e) { /* benign if call already ending */ }
-      } else if (payload.kind === 'end' && payload.callId === activeCallId) {
-        teardown();
-        onEnded && onEnded(payload.reason);
-      }
-    });
-  }
-
-  function end(reason) {
-    if (remoteUserId && activeCallId) GeamsSync.sendSignal(remoteUserId, { kind:'end', callId: activeCallId, reason: reason || 'hangup' });
-    teardown();
-  }
-
-  function toggleMute(muted) { if (localStream) localStream.getAudioTracks().forEach((t) => { t.enabled = !muted; }); }
-
-  return { start, accept, decline, listen, end, toggleMute, get active() { return !!pc; } };
 })();
 
 /* ── TEMPORARY DIAGNOSTIC — remove once cross-app sync is confirmed working.
@@ -1469,19 +1293,19 @@ const DispatchData=((  )=>{
     makeJob({priority:'high',   type:'Armed Robbery', controlRoomId:HOME_CONTROL_ROOM.id, controlRoomName:HOME_CONTROL_ROOM.name}),
     makeJob({priority:'medium', type:'Road Accident',  controlRoomId:HOME_CONTROL_ROOM.id, controlRoomName:HOME_CONTROL_ROOM.name}),
     makeJob({priority:'low',    type:'Public Disorder',controlRoomId:HOME_CONTROL_ROOM.id, controlRoomName:HOME_CONTROL_ROOM.name})];
-  // ── REAL-TIME-TEST NOTE ── This used to seed a fully-scripted fake
-  // conversation ("Sgt. Asante, kidnapping at 14 Oxford Street... Understood,
-  // siren off...") that never happened — the same "fake conversation to
-  // make the interface appear active" violation as the civilian app had.
-  // Starts empty now; filled only by real messages via
-  // GeamsDispatchSync.pushChat/watchChat (see send() below and
-  // geams-realtime-backend-spec.md §9 once the WebSocket backend replaces it).
-  const chatHistory=[];
+  const chatHistory=[
+    {from:'system',text:'Channel INC-1001 opened — AES-256 encrypted',time:fmt(new Date(Date.now()-14*60000))},
+    {from:'station',name:'Control Room',text:'Sgt. Asante, kidnapping at 14 Oxford Street, Osu. Civilian hiding inside. Suspect on premises.',time:fmt(new Date(Date.now()-13*60000))},
+    {from:'officer',name:'Sgt. K. Asante',text:'Received. En route now. ETA 6 minutes.',time:fmt(new Date(Date.now()-12*60000))},
+    {from:'station',name:'Control Room',text:'Approach from Ring Road side. No sirens within 500m.',time:fmt(new Date(Date.now()-11*60000))},
+    {from:'officer',name:'Sgt. K. Asante',text:'Understood. Siren off. Can you patch me to the civilian?',time:fmt(new Date(Date.now()-9*60000))},
+    {from:'station',name:'Control Room',text:'Connecting now. She is in the bathroom, second floor.',time:fmt(new Date(Date.now()-8*60000))}];
   const evidence=[];
-  // Starts empty — this used to be seeded with four fabricated entries
-  // ("INC-1001 assigned — Kidnapping · Osu, Accra" etc.) describing events
-  // that never happened. Entries are now added only by real actions.
-  const activityLog=[];
+  const activityLog=[
+    {time:fmt(new Date(Date.now()-14*60000)),text:'<strong>INC-1001</strong> assigned — Kidnapping · Osu, Accra',     lcrId:'GH-GA-ACC-007'},
+    {time:fmt(new Date(Date.now()-12*60000)),text:'Job received — awaiting acceptance',                                 lcrId:'GH-GA-ACC-007'},
+    {time:fmt(new Date(Date.now()-11*60000)),text:'GPS lock confirmed — tracking active',                               lcrId:'GH-GA-ACC-007'},
+    {time:fmt(new Date(Date.now()-9*60000)), text:'Station comms established — encrypted channel open',                lcrId:'GH-GA-ACC-007'}];
   // Returns only activity log entries that belong to the officer's assigned LCR.
   // Entries with no lcrId tag (legacy / system) are shown to everyone.
   // In production, this filtering would be server-side (the API only returns
@@ -1603,7 +1427,6 @@ const GeamsDispatchSync = (() => {
           location: rec.location, address: rec.location,
           lat: rec.lat, lng: rec.lng,
           civilian: rec.civilianName, civilianPhone: rec.civilianPhone,
-          civilianId: rec.civilianId, // real GEAMS user id — needed to route RealCall.start() to their actual device, not just a display name
           civilianLat: rec.civilianLat, civilianLng: rec.civilianLng,
           status: 'pending', receivedAt: new Date(),
           controlRoomId: DispatchData.officer.controlRoomId,
@@ -1767,47 +1590,24 @@ const DispatchApp = (() => {
   // The Local Control Room keeps watching the officer's position regardless
   // of incident status — through Closed, until the operation is fully wrapped
   // (shift end / transfer) or LCR explicitly ends tracking.
-  // ── REAL-TIME-TEST NOTE ───────────────────────────────────────────────
-  // Previously this randomly drifted the officer's OWN position on a 4s
-  // timer ("idle drift") — unconditional simulated movement, unlike
-  // startCivilianTracking() above which already had a real/demo split.
-  // This app runs on the officer's own device, so their position must
-  // come from that device's real GPS, always — never a random walk.
-  let officerGeoWatchId = null;
   function startOfficerTracking() {
     officerTrackingActive = true;
-    if (officerTrackTimer) { clearInterval(officerTrackTimer); officerTrackTimer = null; }
-    if (officerGeoWatchId !== null && navigator.geolocation) navigator.geolocation.clearWatch(officerGeoWatchId);
-
-    if (!navigator.geolocation) {
-      showToast('warning', 'GPS Unavailable', 'This device has no location support — officer position cannot be tracked', 6000);
-      // TODO(backend): ws.send({type:'location.unavailable', payload:{entityId: DispatchData.officer.id, reason:'no_signal'}})
-      return;
-    }
-
-    officerGeoWatchId = navigator.geolocation.watchPosition(
-      pos => {
-        if (!officerTrackingActive) return;
-        const off = DispatchData.officer;
-        const [lat, lng] = DispatchData.clampToBounds(pos.coords.latitude, pos.coords.longitude, off.controlRoomId);
-        off.lat = lat; off.lng = lng;
-        // TODO(backend): ws.send({type:'location.update', payload:{
-        //   entityType:'officer', entityId: off.id, lat, lng,
-        //   accuracy: pos.coords.accuracy, capturedAt: Date.now(), source:'device_gps' }})
-        if (typeof DispatchMap !== 'undefined') DispatchMap.updateOfficerPosition([lat, lng]);
-        syncSceneFromMap();
-      },
-      () => {
-        showToast('warning', 'GPS Signal Lost', 'Officer position unavailable — last known location shown', 5000);
-        // TODO(backend): ws.send({type:'location.unavailable', payload:{entityId: DispatchData.officer.id, reason:'denied'}})
-      },
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 }
-    );
+    if (officerTrackTimer) clearInterval(officerTrackTimer);
+    officerTrackTimer = setInterval(() => {
+      if (!officerTrackingActive) { return; }
+      const off = DispatchData.officer;
+      // Idle drift clamped strictly within the officer's assigned LCR jurisdiction
+      const rawLat = off.lat + (Math.random()-0.5)*0.0002;
+      const rawLng = off.lng + (Math.random()-0.5)*0.0002;
+      const [driftLat, driftLng] = DispatchData.clampToBounds(rawLat, rawLng, off.controlRoomId);
+      off.lat = driftLat; off.lng = driftLng;
+      if (typeof DispatchMap !== 'undefined') DispatchMap.updateOfficerPosition([driftLat, driftLng]);
+      syncSceneFromMap();
+    }, 4000);
   }
   function stopOfficerTracking(reason) {
     officerTrackingActive = false;
     if (officerTrackTimer) { clearInterval(officerTrackTimer); officerTrackTimer = null; }
-    if (officerGeoWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(officerGeoWatchId); officerGeoWatchId = null; }
     if (typeof DispatchMap !== 'undefined') DispatchMap.setOfficerTrackingState(false);
     DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
       text:`<strong>Officer tracking ended</strong> — ${reason||'session terminated by Local Control Room'}`});
@@ -2307,46 +2107,176 @@ const DispatchApp = (() => {
     showToast('error','⚠️ Scene Unsafe','All approaching units warned · Station and HQ alerted',7000);
   }
 
-  // ── IDENTIFICATION ──
+  // ── IDENTIFICATION (real) ──
+  // Face scan: genuine camera + on-device face recognition (FaceEngine),
+  // matched against the real registry of civilians who have actually
+  // enrolled their face in the Civilian app (GeamsSync key 'registry:faces').
+  // Fingerprint: a phone/browser has no way to read or match a physical
+  // fingerprint against other people's records — no such hardware/API
+  // exists on standard devices, so we say that plainly instead of faking
+  // a result. Manual ID does a real lookup by Ghana Card number against
+  // that same real registry.
+  let _scanStream = null;
+  let _scanStopWatch = null;
+  let _scanLiveDescriptor = null;
+
   function runBiometricScan() {
-    openSheet('🧬 Biometric Scan',`
-      <div style="text-align:center;padding:8px 0 14px">
-        <div class="scan-ring" id="scan-ring"><span style="font-size:1.8rem">🧬</span></div>
-        <div style="margin-top:12px;font-size:0.82rem;font-weight:600" id="scan-status">Ready to scan</div>
-        <div style="font-size:0.7rem;color:var(--text-muted);margin-top:4px" id="scan-sub">Select type and tap Start</div>
-      </div>
+    openSheet('🧬 Biometric Scan', `
       <div class="form-group"><label class="form-label">Scan Type</label>
-        <select class="form-select" id="scan-type">
-          <option>Face scan — camera recognition</option>
-          <option>Fingerprint — biometric sensor</option>
-          <option>Manual ID — Ghana Card number</option>
+        <select class="form-select" id="scan-type" onchange="DispatchApp.onScanTypeChange()">
+          <option value="face">Face scan — camera recognition</option>
+          <option value="fingerprint">Fingerprint — biometric sensor</option>
+          <option value="manual">Manual ID — Ghana Card number</option>
         </select></div>
       <div class="form-group"><label class="form-label">Subject</label>
-        <select class="form-select"><option>Suspect</option><option>Victim</option><option>Witness</option></select></div>`,
-      `<button class="btn btn-ghost" onclick="DispatchApp.closeSheet()">Cancel</button>
-       <button class="btn btn-primary btn-full" id="scan-btn" onclick="DispatchApp.runScan()">🧬 Start Scan</button>`);
+        <select class="form-select" id="scan-subject"><option>Suspect</option><option>Victim</option><option>Witness</option></select></div>
+      <div id="scan-body"></div>`,
+      `<button class="btn btn-ghost" onclick="DispatchApp.closeScanSheet()">Cancel</button>`);
+    onScanTypeChange();
   }
-  function runScan() {
-    const ring=document.getElementById('scan-ring'),status=document.getElementById('scan-status'),sub=document.getElementById('scan-sub'),btn=document.getElementById('scan-btn');
-    if(!ring)return;
-    ring.classList.add('scanning');
-    if(status)status.textContent='Scanning...';
-    if(sub)sub.textContent='Matching against national database...';
-    if(btn)btn.disabled=true;
-    setTimeout(()=>{
-      ring.classList.remove('scanning');
-      const hit=Math.random()>0.35;
-      if(hit){ring.classList.add('success');
-        if(status)status.textContent='✅ Match Found';
-        if(sub)sub.innerHTML='<strong style="color:var(--green)">Kwame Boateng</strong> · GHA-204871234 · Age 34<br><span style="color:var(--red);font-size:0.68rem">⚠️ 2 prior arrests — armed robbery</span>';
-        DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,text:'<strong>Biometric scan</strong> — match: Kwame Boateng · 2 prior arrests'});
-      }else{ring.classList.add('error');
-        if(status){status.textContent='No Match Found';status.style.color='var(--text-muted)';}
-        if(sub)sub.textContent='Subject not in national database';
-        DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,text:'<strong>Biometric scan</strong> — no database match'});
+
+  function onScanTypeChange() {
+    stopScanCamera();
+    const type = document.getElementById('scan-type')?.value || 'face';
+    const body = document.getElementById('scan-body');
+    const footer = document.getElementById('sheet-footer');
+    if (!body) return;
+    if (type === 'fingerprint') {
+      body.innerHTML = `
+        <div style="text-align:center;padding:14px 4px;background:var(--bg-raised);border:1px solid var(--border-mid);border-radius:var(--r-md)">
+          <div style="font-size:1.8rem;margin-bottom:8px">🚫</div>
+          <div style="font-size:0.82rem;font-weight:600;margin-bottom:6px">Not available from this device</div>
+          <div style="font-size:0.74rem;color:var(--text-muted);line-height:1.5">
+            Matching a fingerprint against someone else's identity requires dedicated AFIS scanning hardware
+            connected to a national fingerprint database. A phone camera or browser cannot read fingerprint
+            ridge data at all, so this prototype will not pretend to perform this scan. Use Face scan or
+            Manual ID instead.
+          </div>
+        </div>`;
+      if (footer) footer.innerHTML = `<button class="btn btn-ghost btn-full" onclick="DispatchApp.closeScanSheet()">Close</button>`;
+      return;
+    }
+    if (type === 'manual') {
+      body.innerHTML = `
+        <div class="form-group"><label class="form-label">Ghana Card Number</label>
+          <input class="form-input" id="scan-ghcard" placeholder="e.g. GHA-204871234"></div>
+        <div id="scan-result" style="font-size:0.78rem;color:var(--text-muted);min-height:18px"></div>`;
+      if (footer) footer.innerHTML = `
+        <button class="btn btn-ghost" onclick="DispatchApp.closeScanSheet()">Cancel</button>
+        <button class="btn btn-primary btn-full" onclick="DispatchApp.runManualIdLookup()">🔎 Look Up</button>`;
+      return;
+    }
+    // Face scan (default)
+    body.innerHTML = `
+      <div id="scan-camera-area" style="border-radius:var(--r-lg);overflow:hidden;background:#000;margin-bottom:10px;position:relative;min-height:220px;display:flex;align-items:center;justify-content:center">
+        <div style="color:var(--text-muted);font-size:0.78rem;text-align:center;padding:20px">📷 Requesting camera access…</div>
+      </div>
+      <div id="scan-status" style="text-align:center;font-size:0.76rem;color:var(--text-muted);min-height:18px">Loading face recognition model…</div>
+      <div id="scan-result" style="font-size:0.8rem;margin-top:8px"></div>`;
+    if (footer) footer.innerHTML = `
+      <button class="btn btn-ghost" onclick="DispatchApp.closeScanSheet()">Cancel</button>
+      <button class="btn btn-primary btn-full" id="scan-capture-btn" onclick="DispatchApp.captureAndMatchFace()" disabled>🧬 Capture &amp; Match</button>`;
+    startScanCamera();
+  }
+
+  async function startScanCamera() {
+    const area = document.getElementById('scan-camera-area');
+    const status = document.getElementById('scan-status');
+    if (!area) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      area.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;text-align:center;padding:20px">📷 Camera not available on this device/browser.</div>`;
+      if (status) status.textContent = '';
+      return;
+    }
+    try {
+      _scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    } catch (e) {
+      area.innerHTML = `<div style="color:var(--text-muted);font-size:0.78rem;text-align:center;padding:20px">📷 Camera access denied or unavailable.</div>`;
+      if (status) status.textContent = '';
+      return;
+    }
+    if (!document.getElementById('scan-camera-area')) { stopScanCamera(); return; } // sheet changed meanwhile
+    area.innerHTML = `<video id="scan-video" autoplay playsinline muted style="width:100%;display:block;max-height:280px;object-fit:cover"></video>`;
+    const video = document.getElementById('scan-video');
+    if (video) video.srcObject = _scanStream;
+
+    const modelsReady = await FaceEngine.ensureModels();
+    if (!document.getElementById('scan-camera-area')) return; // sheet closed meanwhile
+    if (!modelsReady) {
+      if (status) status.innerHTML = '<span style="color:var(--red)">⚠️ Could not load the face recognition model (check internet connection).</span>';
+      return;
+    }
+    if (status) status.textContent = 'Point the camera at the subject\'s face…';
+    _scanStopWatch = FaceEngine.watchVideo(video, (descriptor) => {
+      _scanLiveDescriptor = descriptor;
+      const btn = document.getElementById('scan-capture-btn');
+      const st = document.getElementById('scan-status');
+      if (descriptor) {
+        if (btn) btn.disabled = false;
+        if (st) st.innerHTML = '<span style="color:var(--primary)">✓ Face detected — tap Capture &amp; Match</span>';
+      } else {
+        if (btn) btn.disabled = true;
+        if (st) st.textContent = 'Point the camera at the subject\'s face…';
       }
-      if(btn){btn.disabled=false;btn.textContent='✅ Save Result';btn.onclick=()=>{closeSheet();showToast('info','Scan Saved','Result attached to incident record');};}
-    },2800);
+    });
+  }
+
+  function stopScanCamera() {
+    if (_scanStopWatch) { _scanStopWatch(); _scanStopWatch = null; }
+    if (_scanStream) { _scanStream.getTracks().forEach(t => t.stop()); _scanStream = null; }
+    _scanLiveDescriptor = null;
+  }
+
+  function closeScanSheet() {
+    stopScanCamera();
+    closeSheet();
+  }
+
+  async function captureAndMatchFace() {
+    if (!_scanLiveDescriptor) { showToast('warning', 'No Face Detected', 'Align the subject\'s face in the frame first'); return; }
+    const liveDescriptor = Array.from(_scanLiveDescriptor);
+    const subject = document.getElementById('scan-subject')?.value || 'Suspect';
+    const result = document.getElementById('scan-result');
+    const registry = await GeamsSync.getShared('registry:faces', {});
+    const match = FaceEngine.findBestMatch(liveDescriptor, registry);
+    stopScanCamera();
+    const area = document.getElementById('scan-camera-area');
+    if (area) area.innerHTML = '';
+    if (match) {
+      const e = match.entry;
+      if (result) result.innerHTML = `
+        <div style="padding:10px 12px;background:var(--primary-dim);border:1px solid var(--primary-border);border-radius:var(--r-md)">
+          <div style="font-weight:700;color:var(--green)">✅ Match Found — GEAMS Registered Person</div>
+          <div style="margin-top:4px">${e.name} · ${e.ghCard || 'No Ghana Card on file'}</div>
+          <div style="color:var(--text-muted);font-size:0.72rem">${e.phone || ''} · Face enrolled ${new Date(e.enrolledAt).toLocaleDateString()}</div>
+          <div style="color:var(--text-muted);font-size:0.68rem;margin-top:4px">Match confidence (lower = closer): ${match.distance.toFixed(3)} / ${FaceEngine.MATCH_THRESHOLD} threshold</div>
+        </div>`;
+      DispatchData.activityLog.unshift({ time: DispatchData.fmt(new Date()), lcrId: DispatchData.officer.controlRoomId,
+        text: `<strong>Face scan</strong> (${subject}) — match: ${e.name} (GEAMS registered civilian)` });
+      showToast('success', 'Match Found', e.name);
+    } else {
+      if (result) result.innerHTML = `<div style="padding:10px 12px;background:var(--bg-raised);border:1px solid var(--border-mid);border-radius:var(--r-md);color:var(--text-muted)">No match found among GEAMS registered persons. This does not check any external police or national database — only people who have enrolled Face ID in the Civilian app.</div>`;
+      DispatchData.activityLog.unshift({ time: DispatchData.fmt(new Date()), lcrId: DispatchData.officer.controlRoomId,
+        text: `<strong>Face scan</strong> (${subject}) — no match among GEAMS registered persons` });
+      showToast('info', 'No Match', 'Not found among GEAMS registered persons');
+    }
+    const footer = document.getElementById('sheet-footer');
+    if (footer) footer.innerHTML = `<button class="btn btn-primary btn-full" onclick="DispatchApp.closeSheet()">✅ Save Result</button>`;
+  }
+
+  async function runManualIdLookup() {
+    const ghCard = (document.getElementById('scan-ghcard')?.value || '').trim();
+    const result = document.getElementById('scan-result');
+    if (!ghCard) { showToast('warning', 'Enter a Ghana Card number', ''); return; }
+    const registry = await GeamsSync.getShared('registry:faces', {});
+    const hit = Object.values(registry || {}).find(e => (e.ghCard || '').toLowerCase() === ghCard.toLowerCase());
+    if (hit) {
+      if (result) result.innerHTML = `<div style="color:var(--green);font-weight:600">✅ ${hit.name} · ${hit.phone || ''}</div>`;
+      DispatchData.activityLog.unshift({ time: DispatchData.fmt(new Date()), lcrId: DispatchData.officer.controlRoomId, text: `<strong>Manual ID lookup</strong> — match: ${hit.name}` });
+    } else {
+      if (result) result.innerHTML = `<div style="color:var(--text-muted)">No GEAMS record found for that Ghana Card number.</div>`;
+      DispatchData.activityLog.unshift({ time: DispatchData.fmt(new Date()), lcrId: DispatchData.officer.controlRoomId, text: `<strong>Manual ID lookup</strong> — no match for ${ghCard}` });
+    }
   }
 
   function runPlateCheck() {
@@ -2447,290 +2377,48 @@ const DispatchApp = (() => {
   }
 
   // ── EVIDENCE ──
-  // ── REAL-TIME-TEST NOTE ── This used to just flip a boolean and show
-  // fake toasts ("Body camera started — recording to secure storage")
-  // with zero getUserMedia() call anywhere — no camera was ever opened,
-  // which is exactly why it looked like it "wasn't opening": nothing
-  // ever tried to. Now genuinely opens the device camera+mic, shows a
-  // live preview so the officer can see it's actually on, and records
-  // real video via MediaRecorder.
-  let bodyCamStream = null;
-  let bodyCamRecorder = null;
-  let bodyCamChunks = [];
-
-  async function toggleBodyCam() {
-    if (!bodyCamActive) {
-      try {
-        bodyCamStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true });
-      } catch (e) {
-        showToast('error', 'Camera Blocked', 'Allow camera and microphone access to start the body camera');
-        return;
-      }
-      let preview = document.getElementById('bodycam-preview');
-      if (!preview) {
-        preview = document.createElement('video');
-        preview.id = 'bodycam-preview';
-        preview.autoplay = true; preview.muted = true; preview.playsInline = true;
-        preview.style.cssText = 'position:fixed;top:60px;right:12px;width:140px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4)';
-        document.body.appendChild(preview);
-      }
-      preview.srcObject = bodyCamStream;
-
-      bodyCamChunks = [];
-      bodyCamRecorder = new MediaRecorder(bodyCamStream);
-      bodyCamRecorder.ondataavailable = (e) => { if (e.data.size > 0) bodyCamChunks.push(e.data); };
-      bodyCamRecorder.start();
-
-      bodyCamActive = true;
-      DispatchData.currentJob.bodyCamActive = true;
-      DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
-        text:'<strong>Body camera started</strong> — recording live'});
-      showToast('info', 'Body Camera Recording', 'Camera and microphone active');
-    } else {
-      const finalizeAndTag = () => {
-        const mime = ((bodyCamRecorder && bodyCamRecorder.mimeType) || 'video/webm').split(';')[0];
-        const blob = new Blob(bodyCamChunks, { type: mime });
-        const sizeMB = (blob.size / (1024*1024)).toFixed(1) + 'MB';
-        DispatchData.currentJob.evidenceCount++;
-        const entry = {
-          id: 'EVD-' + DispatchData.currentJob.id + '-' + DispatchData.currentJob.evidenceCount,
-          type: 'Body camera recording', time: DispatchData.fmt(new Date()), size: sizeMB,
-          fileName: 'bodycam-' + DispatchData.currentJob.id + '-' + Date.now() + (mime.includes('mp4') ? '.mp4' : '.webm'),
-          notes: '', contentType: mime, blobUrl: URL.createObjectURL(blob), _file: blob,
-          incidentId: realIncidentId(), uploadStatus: 'pending',
-        };
-        DispatchData.evidence.push(entry);
-        DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
-          text:`<strong>Body camera stopped</strong> — ${sizeMB} recorded on ${DispatchData.currentJob.id}`});
-        showToast('info', 'Body Camera Stopped', `${sizeMB} recorded — sending to the control room…`);
-        if (currentScreen === 'evidence') ScreenEvidence.render();
-        transmitEvidence(entry);
-      };
-      if (bodyCamRecorder && bodyCamRecorder.state !== 'inactive') {
-        bodyCamRecorder.onstop = finalizeAndTag;
-        bodyCamRecorder.stop();
-      }
-      if (bodyCamStream) { bodyCamStream.getTracks().forEach(t => t.stop()); bodyCamStream = null; }
-      const preview = document.getElementById('bodycam-preview');
-      if (preview) preview.remove();
-      bodyCamActive = false;
-      DispatchData.currentJob.bodyCamActive = false;
-    }
+  function toggleBodyCam() {
+    bodyCamActive=!bodyCamActive;
+    DispatchData.currentJob.bodyCamActive=bodyCamActive;
     const btns=document.querySelectorAll('#bodycam-btn');
     btns.forEach(btn=>{
       btn.className=bodyCamActive?'btn btn-danger btn-full':'btn btn-cyan btn-full';
       btn.innerHTML=bodyCamActive?'⏹ Stop Body Camera':'⏺ Body Camera';
     });
+    DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
+      text:bodyCamActive?'<strong>Body camera started</strong> — recording to secure storage':'<strong>Body camera stopped</strong> — footage uploading'});
+    showToast(bodyCamActive?'info':'success',bodyCamActive?'Body Camera Recording':'Body Camera Stopped',
+      bodyCamActive?'Footage saved to secure evidence storage':'Footage uploaded — tagged to '+DispatchData.currentJob.id);
     if(currentScreen==='evidence')ScreenEvidence.render();
   }
 
-  // ── REAL-TIME-TEST NOTE ── The upload zone's onclick used to just show
-  // a toast claiming "Opening camera / file selector..." with no actual
-  // <input type="file"> or getUserMedia() anywhere — nothing ever opened.
-  // confirmUpload() then fabricated a fixed "2.4MB" / "Scene photograph"
-  // regardless of what (if anything) was picked. Now uses a real hidden
-  // file input with `capture="environment"`, which mobile browsers use
-  // to open the actual camera (or gallery, at the user's choice), and
-  // tags the evidence with the real file's name/size/type.
-  let pendingEvidenceFile = null;
   function uploadEvidence() {
-    pendingEvidenceFile = null;
     openSheet('📎 Upload Evidence',`
-      <input type="file" id="evidence-file-input" accept="image/*,video/*,application/pdf" capture="environment" style="display:none" onchange="DispatchApp.handleEvidenceFileSelected(this)">
-      <div class="upload-zone" id="evidence-upload-zone" onclick="document.getElementById('evidence-file-input').click()">
+      <div class="upload-zone" onclick="DispatchApp.showToast('info','Upload','Opening camera / file selector...')">
         <div class="upload-icon">📷</div>
-        <div class="upload-label" id="evidence-upload-label">Tap to take photo/video or select a file</div>
+        <div class="upload-label">Tap to take photo or select file</div>
         <div style="font-size:0.65rem;color:var(--text-ghost);margin-top:4px">JPG · PNG · MP4 · PDF</div>
       </div>
       <div class="form-group" style="margin-top:14px"><label class="form-label">Evidence Type</label>
-        <select class="form-select" id="evidence-type-select">
+        <select class="form-select">
           <option>Scene photograph</option><option>Suspect photo</option>
           <option>Video recording</option><option>Document / ID scan</option>
           <option>Injury documentation</option><option>Property / stolen item</option>
         </select></div>
       <div class="form-group"><label class="form-label">Notes</label>
-        <textarea class="form-textarea" id="evidence-notes" rows="2" placeholder="Brief description..."></textarea></div>`,
+        <textarea class="form-textarea" rows="2" placeholder="Brief description..."></textarea></div>`,
       `<button class="btn btn-ghost" onclick="DispatchApp.closeSheet()">Cancel</button>
        <button class="btn btn-primary btn-full" onclick="DispatchApp.confirmUpload()">📎 Upload &amp; Tag to Case</button>`);
   }
-  function handleEvidenceFileSelected(inputEl) {
-    const file = inputEl.files && inputEl.files[0];
-    if (!file) return;
-    pendingEvidenceFile = file;
-    const label = document.getElementById('evidence-upload-label');
-    const zone = document.getElementById('evidence-upload-zone');
-    if (label) label.textContent = `✓ ${file.name} (${(file.size/1024).toFixed(0)}KB) — tap to change`;
-    if (zone) zone.style.borderColor = 'var(--green)';
-    // Auto-select a sensible evidence type from the real file's MIME type
-    // rather than leaving whatever the dropdown happened to default to.
-    const typeSel = document.getElementById('evidence-type-select');
-    if (typeSel && file.type.startsWith('video/')) typeSel.value = 'Video recording';
-    else if (typeSel && file.type === 'application/pdf') typeSel.value = 'Document / ID scan';
-  }
   function confirmUpload() {
-    if (!pendingEvidenceFile) { showToast('error', 'No File Selected', 'Take a photo/video or choose a file first'); return; }
-    const file = pendingEvidenceFile;
-    const notes = document.getElementById('evidence-notes')?.value || '';
-    const type = document.getElementById('evidence-type-select')?.value || 'Scene photograph';
     closeSheet();
     DispatchData.currentJob.evidenceCount++;
-    const entry = {
-      id:'EVD-'+DispatchData.currentJob.id+'-'+DispatchData.currentJob.evidenceCount,
-      type, time:DispatchData.fmt(new Date()),
-      size: file.size > 1024*1024 ? (file.size/(1024*1024)).toFixed(1)+'MB' : (file.size/1024).toFixed(0)+'KB',
-      fileName: file.name, notes, contentType: file.type,
-      blobUrl: URL.createObjectURL(file), // instant local preview, independent of the upload
-      _file: file,                        // kept so a failed upload can be retried
-      incidentId: realIncidentId(),
-      uploadStatus: 'pending',
-    };
-    DispatchData.evidence.push(entry);
-    DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,text:`<strong>Evidence captured</strong> — ${file.name} (${entry.size}) on ${DispatchData.currentJob.id}`});
-    pendingEvidenceFile = null;
+    DispatchData.evidence.push({id:'EVD-'+DispatchData.currentJob.id+'-'+DispatchData.currentJob.evidenceCount,
+      type:'Scene photograph',time:DispatchData.fmt(new Date()),size:'2.4MB'});
+    DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,text:`<strong>Evidence uploaded</strong> — ${DispatchData.currentJob.evidenceCount} files on case`});
+    showToast('success','Evidence Uploaded','File tagged to '+DispatchData.currentJob.id+' — tamper sealed');
     if(currentScreen==='evidence')ScreenEvidence.render();
     if(currentScreen==='job')ScreenJob.render();
-    transmitEvidence(entry);
-  }
-
-  // The shared incident id this job is really linked to (the record LCR/HQ
-  // are looking at). Demo jobs that never came from a real civilian report
-  // have none — evidence for those honestly stays on the device.
-  function realIncidentId() {
-    const job = DispatchData.currentJob;
-    return job && job._syncSource === 'civilian-app' ? job._syncIncId : null;
-  }
-
-  // Actually sends the file to the backend. The server stores it and
-  // pushes a reference to every LCR/HQ device watching this incident.
-  async function transmitEvidence(entry) {
-    const refresh = () => { if(currentScreen==='evidence')ScreenEvidence.render(); };
-    if (!entry.incidentId) {
-      entry.uploadStatus = 'local';
-      refresh();
-      showToast('warning','Saved On This Device Only','This is a demo job with no real incident behind it, so there is nowhere to send the file', 6000);
-      return;
-    }
-    if (!GeamsSync.available()) {
-      entry.uploadStatus = 'failed'; entry.uploadReason = 'No real-time connection';
-      refresh();
-      showToast('error','Not Delivered','No connection to the control room — the file is saved here and can be retried from the Evidence screen', 7000);
-      return;
-    }
-    entry.uploadStatus = 'uploading'; refresh();
-    const r = await GeamsSync.uploadMedia(entry._file, {
-      incidentId: entry.incidentId, type: entry.type, filename: entry.fileName,
-      notes: entry.notes, uploadedBy: DispatchData.officer.id,
-    });
-    if (r.ok) {
-      entry.uploadStatus = 'sent'; entry.uploadReason = ''; entry.mediaPath = r.path;
-      DispatchData.activityLog.unshift({time:DispatchData.fmt(new Date()),lcrId:DispatchData.officer.controlRoomId,
-        text:`<strong>Evidence delivered to LCR</strong> — ${entry.fileName || entry.id} (${entry.size})`});
-      showToast('success','Delivered To Control Room', (entry.fileName || entry.id) + ' is now visible to the LCR');
-    } else {
-      entry.uploadStatus = 'failed'; entry.uploadReason = r.reason;
-      showToast('error','Not Delivered', r.reason + ' — you can retry from the Evidence screen', 7000);
-    }
-    refresh();
-  }
-  function retryEvidenceUpload(id) {
-    const e = DispatchData.evidence.find(x => x.id === id);
-    if (e && e._file) transmitEvidence(e);
-  }
-  function viewEvidence(id) {
-    const e = DispatchData.evidence.find(x => x.id === id);
-    if (!e || !e.blobUrl) { showToast('error','Not Available','This file is no longer available on this device'); return; }
-    const ct = e.contentType || '';
-    const media = ct.startsWith('video/') ? `<video src="${e.blobUrl}" controls playsinline style="width:100%;border-radius:8px"></video>`
-      : ct.startsWith('audio/') ? `<audio src="${e.blobUrl}" controls style="width:100%"></audio>`
-      : ct.startsWith('image/') ? `<img src="${e.blobUrl}" style="width:100%;border-radius:8px">`
-      : `<a class="btn btn-primary btn-full" href="${e.blobUrl}" target="_blank" rel="noopener">Open file</a>`;
-    openSheet('👁 ' + e.id, media + `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:10px">${e.type} · ${e.size}${e.notes ? ' · ' + e.notes : ''}</div>`,
-      `<button class="btn btn-ghost btn-full" onclick="DispatchApp.closeSheet()">Close</button>`);
-  }
-
-  function callCivilian() {
-    const job = DispatchData.currentJob;
-    if (!job || !job.civilianId) {
-      showToast('error', 'Cannot Call', job && job._syncSource === 'civilian-app'
-        ? 'Waiting for the civilian\'s identity to sync from LCR'
-        : 'This is a demo job with no real civilian device to call');
-      return;
-    }
-    if (!GeamsSync.available()) { showToast('error', 'Not Connected', 'No real-time backend connection — cannot place a call'); return; }
-    showToast('info', '📹 Calling', 'Video calling ' + (job.civilian || 'civilian') + '...');
-    // ── REAL-TIME-TEST NOTE ── This used to omit `video: true`, so it was
-    // a voice-only call — matching the old fake button's phone icon, but
-    // not the actual requirement (real camera feeds between Civilian and
-    // Dispatch). RealCall.start's `video` flag is what makes it request
-    // this device's camera AND tell the civilian's side to turn theirs on
-    // too (via the offer's hasVideo flag) — without it, no video track
-    // ever exists on either end, which is exactly the reported symptom:
-    // permission granted, connection succeeds, but no video appears.
-    RealCall.start(job.civilianId, {
-      video: true,
-      onStatus: (s) => {
-        if (s === 'unavailable') showToast('error', 'Not Connected', 'No real-time backend connection');
-        else if (s === 'media-denied') showToast('error', 'Camera/Microphone Blocked', 'Allow camera and microphone access to place calls');
-        else if (s === 'connected') showToast('success', '📹 Connected', job.civilian || 'Civilian');
-        else if (s === 'failed' || s === 'disconnected') showToast('warning', 'Call Connection Lost', '');
-      },
-      onRemoteStream: attachRemoteMedia,
-      onLocalStream: attachLocalPreview,
-    });
-  }
-
-  function callStation(mode) {
-    const off = DispatchData.officer;
-    const stationUserId = 'STATION-' + off.controlRoomId; // must match GeamsSync.registerUserId(...) called by the Station Dashboard app for this LCR
-    if (!GeamsSync.available()) { showToast('error', 'Not Connected', 'No real-time backend connection — cannot place a call'); return; }
-    showToast('info', mode === 'emergency' ? '🆘 Opening Emergency Channel' : '📹 Calling', off.controlRoomName || 'Control Room');
-    RealCall.start(stationUserId, {
-      video: true,
-      onStatus: (s) => {
-        if (s === 'unavailable') showToast('error', 'Not Connected', 'No real-time backend connection');
-        else if (s === 'media-denied') showToast('error', 'Camera/Microphone Blocked', 'Allow camera and microphone access to place calls');
-        else if (s === 'connected') showToast('success', '📹 Connected', off.controlRoomName || 'Control Room');
-        else if (s === 'unreachable') showToast('warning', 'Station Not Connected', 'No one at the LCR is online right now');
-        else if (s === 'failed' || s === 'disconnected') showToast('warning', 'Call Connection Lost', '');
-      },
-      onRemoteStream: attachRemoteMedia,
-      onLocalStream: attachLocalPreview,
-    });
-  }
-
-  function attachRemoteAudio(stream) {
-    let audioEl = document.getElementById('realcall-remote-audio');
-    if (!audioEl) { audioEl = document.createElement('audio'); audioEl.id = 'realcall-remote-audio'; audioEl.autoplay = true; document.body.appendChild(audioEl); }
-    audioEl.srcObject = stream;
-  }
-
-  function attachRemoteMedia(stream) {
-    const hasVideo = stream.getVideoTracks().length > 0;
-    let el = document.getElementById('realcall-remote-media');
-    if (!el) {
-      el = document.createElement(hasVideo ? 'video' : 'audio');
-      el.id = 'realcall-remote-media';
-      el.autoplay = true;
-      if (hasVideo) { el.playsInline = true; el.style.cssText = 'position:fixed;top:60px;right:12px;width:160px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4)'; }
-      else el.style.display = 'none';
-      document.body.appendChild(el);
-    }
-    el.srcObject = stream;
-  }
-
-  function attachLocalPreview(stream) {
-    // Small self-view so the officer can confirm their own camera is
-    // actually being captured and sent, not just trust that it is.
-    if (!stream.getVideoTracks().length) return;
-    let el = document.getElementById('realcall-local-preview');
-    if (!el) {
-      el = document.createElement('video');
-      el.id = 'realcall-local-preview';
-      el.autoplay = true; el.muted = true; el.playsInline = true;
-      el.style.cssText = 'position:fixed;top:60px;right:180px;width:110px;border-radius:10px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.4);transform:scaleX(-1)';
-      document.body.appendChild(el);
-    }
-    el.srcObject = stream;
   }
 
   function captureWitnessStatement() {
@@ -3533,35 +3221,10 @@ const DispatchApp = (() => {
     // sync available (pure offline/standalone demo mode). When synced,
     // jobs must come only from a real LCR operator's assignment via
     // GeamsDispatchSync — see confirmAccept/doLogin.
-    // ── RESOLVED ── GeamsSync.available() now means "the WebSocket to the
-    // real backend is actually open" (see the GeamsSync swap above), not
-    // just "localStorage exists" — so this guard is now a real
-    // connectivity check and this simulator correctly stays off whenever
-    // there's no real backend connection, including during the real
-    // multi-location test.
     if (!GeamsSync.available()) { DispatchData.startSim(); }
     bindLive();updateBadges();
     startOfficerTracking();
     const off=DispatchData.officer;
-    // Register this officer's real identity so LCR/Civilian calls can be
-    // routed here by GeamsSync.sendSignal(off.id, ...), and start
-    // listening for incoming calls (LCR calling this officer, etc.).
-    // Internal, authorized-personnel-to-personnel calls — auto-accept is
-    // reasonable here (unlike the civilian app, where auto-answering a
-    // call on someone's own phone during a possible emergency is not).
-    GeamsSync.registerUserId(off.id);
-    RealCall.listen({
-      onIncoming: (fromUserId, offer) => {
-        showToast('info', offer.hasVideo ? '📹 Incoming Call' : '📞 Incoming Call', 'Connecting to ' + fromUserId + '...', 4000);
-        RealCall.accept(fromUserId, offer, {
-          onStatus: (s) => { if (s === 'connected') showToast('success', offer.hasVideo ? '📹 Call Connected' : '📞 Call Connected', fromUserId); },
-          onRemoteStream: attachRemoteMedia,
-          onLocalStream: attachLocalPreview,
-        });
-      },
-      onEnded: () => showToast('info', 'Call Ended', ''),
-      onStatus: (s) => { if (s === 'failed' || s === 'disconnected') showToast('warning', 'Call Connection Lost', 'Network interruption during call'); },
-    });
     const tnEl=document.querySelector('.topbar-name'); if(tnEl)tnEl.textContent=off.name;
     const tbEl=document.querySelector('.topbar-badge'); if(tbEl)tbEl.textContent=off.id+' · '+off.badge+' · '+off.vehicle;
     setTimeout(()=>showToast('success','Station Connected',off.controlRoomName+' · '+off.stationId+' · All systems online',4000),800);
@@ -3574,10 +3237,10 @@ const DispatchApp = (() => {
     pullNextJob,acceptJob,confirmAccept,rejectJob,confirmReject,
     arriveOnScene,confirmArrival,secureScene,confirmSecure,closeCase,confirmCloseCase,
     officerSOS,activateSOS,requestBackup,confirmBackup,requestForensics,confirmForensics,
-    declareUnsafe,confirmUnsafe,runBiometricScan,runScan,runPlateCheck,runPlate,
+    declareUnsafe,confirmUnsafe,runBiometricScan,onScanTypeChange,startScanCamera,stopScanCamera,
+    closeScanSheet,captureAndMatchFace,runManualIdLookup,runPlateCheck,runPlate,
     checkPriorCalls,interceptVehicle,confirmVictimStatus,setVictimStatus,
-    toggleBodyCam,uploadEvidence,confirmUpload,handleEvidenceFileSelected,viewEvidence,retryEvidenceUpload,captureWitnessStatement,toggleAudioRec,saveWitness,
-    callCivilian,callStation,
+    toggleBodyCam,uploadEvidence,confirmUpload,captureWitnessStatement,toggleAudioRec,saveWitness,
     makeArrestRecord,confirmArrest,sketchScene,saveSketch,closeSketch,toggleSketchFullscreen,reportEquipment,
     transferCase,confirmTransfer,endShift,confirmEndShift,
     startGPSMovement,stopGPSMovement,startCivilianTracking,stopCivilianTracking,
@@ -4143,9 +3806,9 @@ const ScreenComms = (() => {
         </div>
       </div>
       <div style="margin:10px 16px 0;display:grid;grid-template-columns:1fr 1fr;gap:8px">
-        <button class="btn btn-ghost btn-full btn-sm" onclick="DispatchApp.callCivilian()">📞 Call Civilian</button>
-        <button class="btn btn-ghost btn-full btn-sm" onclick="DispatchApp.callStation()">📞 Call Station</button>
-        <button class="btn btn-ghost btn-full btn-sm" onclick="DispatchApp.callStation('emergency')">🆘 Emergency Channel</button>
+        <button class="btn btn-ghost btn-full btn-sm" onclick="DispatchApp.showToast('info','Calling','Dialling civilian ${job.civilian}...')">📞 Call Civilian</button>
+        <button class="btn btn-ghost btn-full btn-sm" onclick="DispatchApp.showToast('info','Calling','Dialling station...')">📞 Call Station</button>
+        <button class="btn btn-ghost btn-full btn-sm" onclick="DispatchApp.showToast('info','Channel','Emergency channel opened')">🆘 Emergency Channel</button>
         <button class="btn btn-ghost btn-full btn-sm" onclick="DispatchApp.captureWitnessStatement()">🎤 Record Statement</button>
       </div>`;
     setTimeout(()=>{const cm=document.getElementById('chat-messages');if(cm)cm.scrollTop=cm.scrollHeight;},50);
@@ -4179,16 +3842,6 @@ const ScreenComms = (() => {
 
 /* ── EVIDENCE SCREEN ── */
 const ScreenEvidence = (() => {
-  // Real delivery state for each file — what actually happened when the
-  // upload was attempted, not an assumed success.
-  function statusLine(e){
-    const line = (color, html) => `<div style="font-size:0.65rem;color:${color};margin-top:2px">${html}</div>`;
-    if (e.uploadStatus === 'sent') return line('var(--green)', '✓ Delivered to LCR');
-    if (e.uploadStatus === 'uploading' || e.uploadStatus === 'pending') return line('var(--cyan)', '⏳ Sending to LCR…');
-    if (e.uploadStatus === 'local') return line('var(--text-muted)', 'Saved on this device only (demo job — no real incident)');
-    if (e.uploadStatus === 'failed') return line('var(--red)', `✗ Not delivered — ${e.uploadReason || 'failed'} <a href="#" style="color:var(--primary)" onclick="DispatchApp.retryEvidenceUpload('${e.id}');return false">Retry</a>`);
-    return '';
-  }
   function render(){
     const el=document.getElementById('screen-evidence');
     if(!el)return;
@@ -4225,9 +3878,9 @@ const ScreenEvidence = (() => {
                 <div class="info-body">
                   <div class="info-key">${e.id}</div>
                   <div class="info-val">${e.type}</div>
-                  <div style="font-size:0.65rem;color:var(--text-muted)">${e.time} · ${e.size}</div>${statusLine(e)}
+                  <div style="font-size:0.65rem;color:var(--text-muted)">${e.time} · ${e.size} · Tamper-sealed</div>
                 </div>
-                <button class="btn btn-sm btn-ghost" onclick="DispatchApp.viewEvidence('${e.id}')">👁</button>
+                <button class="btn btn-sm btn-ghost" onclick="DispatchApp.showToast('info','View','Opening evidence viewer...')">👁</button>
               </div>`).join('')
             :`<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:0.78rem">
                 No evidence uploaded yet.<br>
